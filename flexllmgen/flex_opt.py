@@ -32,7 +32,7 @@ fix_recursive_import()
 DUMMY_WEIGHT = "_DUMMY_"  # Use dummy weights for benchmark purposes
 
 
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass
 class Policy:
     gpu_batch_size: int
     num_gpu_batches: int
@@ -261,9 +261,12 @@ class OutputEmbed:
         else:
             (w_ln, _), (b_ln, _), (w_token, _) = weight_read_buf.val
 
-        h = self.compute.opt_output_embed(h, w_ln, b_ln, w_token, donate,
+        h, logits = self.compute.opt_output_embed(h, w_ln, b_ln, w_token, donate,
             self.task.do_sample, self.task.temperature)
-        hidden.val = h
+        if self.task.logits:
+            hidden.val = [h, logits]
+        else:
+            hidden.val = h
 
 
 class SelfAttention:
@@ -776,7 +779,14 @@ class OptLM:
         if j == self.num_layers - 1:  # store to output
             gpu_batch_size = self.policy.gpu_batch_size
             left, right = k * gpu_batch_size, (k + 1) * gpu_batch_size
-            ids = self.hidden[i][j][k].pop().data.detach().cpu().numpy()
+            # ids = self.hidden[i][j][k].pop().data.detach().cpu().numpy()
+            if self.task.logits:
+                ids, logits = self.hidden[i][j][k].pop()
+                logits = logits.data.detach().cpu().numpy()
+                ids = ids.data.detach().cpu().numpy()
+            else:
+                ids = self.hidden[i][j][k].pop().data.detach().cpu().numpy()
+                logits = None
             pos = self.task.prompt_len + i
             if self.task.stop:
                 stopped = self.stopped[left:right]
@@ -830,7 +840,96 @@ class OptLM:
             (self.policy.gpu_batch_size, self.task.prompt_len), bool)
         val.load_from_np((input_ids != self.config.pad_token_id))
         self.attention_mask[k].store(val)
+    
+    def get_logits(self, inputs: Union[np.array, List[List[int]]]):
+        
+        max_new_tokens = 1
+        do_sample = False
+        temperature = 1.0
+        stop = None
+        cut_gen_len = 1
+        
+        task = Task(
+            inputs=inputs,
+            prompt_len=len(inputs[0]),
+            gen_len=max_new_tokens,
+            cut_gen_len=cut_gen_len,
+            do_sample=do_sample,
+            temperature=temperature,
+            stop=stop,
+            logits=True
+        )
+        
+        tmp_batch_size = None
+        if self.policy.gpu_batch_size * self.num_gpu_batches != len(task.inputs):
+            tmp_batch_size = self.policy.gpu_batch_size
+            self.policy.gpu_batch_size = len(task.inputs)
+        num_layers = self.num_layers
+        num_batches = self.num_gpu_batches
+        batch_size = self.policy.gpu_batch_size
+        overlap = self.policy.overlap
+        prompt_len, gen_len = task.prompt_len, task.gen_len
+        self.execute_gen_len = task.cut_gen_len if task.cut_gen_len else task.gen_len
+        
+        # Output token ids
+        self.output_ids = np.full((len(task.inputs), prompt_len + gen_len),
+                                  self.config.pad_token_id,
+                                  dtype=np.int32)
+        self.stopped = np.zeros((len(task.inputs), 1), dtype=bool)
+        self.output_ids[:, :prompt_len] = np.asarray(task.inputs)
+        self.logits = np.zeros((len(task.inputs), prompt_len, self.config.vocab_size), dtype=np.float32)
+        # print(f"self.logits shape: {self.logits.shape}, {prompt_len}, {gen_len} \n =========***********");exit()
+        
+        # if len(task.inputs) != batch_size:
+        #     batch_size = len(task.inputs)
+            # self.policy.batch_size = batch_size
+        assert batch_size * num_batches == len(task.inputs), f"batch_size * num_batches != len(task.inputs)! batch_size:{batch_size}, num_batches:{num_batches}, len(task.inputs):{len(task.inputs)}"
+        
+        for j in range(num_layers):
+            for k in range(num_batches):
+                self.cache_home[j][k].clear()
+                self.cache_read_buf[j][k].clear()
+                self.cache_write_buf[j][k].clear()
+                
+        for j in range(num_layers):
+            self.weight_read_buf[j].clear()
+            
+        for k in range(num_batches):
+            self.attention_mask[k].clear()
+            
+        self.hidden = array_3d(gen_len, num_layers, num_batches, ValueHolder)
+        
+        self.set_task(task)
+        
+        for j in range(num_layers):
+            for k in range(num_batches):
+                self.init_cache(j, k)
+        
+        self.env.cpu.init_attention_compute_workspace(self.config, self.task, self.policy)
+        
+        if not overlap:
+            # No overlap, easy to understand, suitable for debugging
+            self.generation_loop_normal()
+        else:
+            # Overlap I/O and compute
+            if num_batches == 1:
+                self.generation_loop_overlap_single_batch()
+            else:
+                self.generation_loop_overlap_multi_batch()
+                # raise NotImplementedError("Only support num_batches=1 for now")
+                # self.generation_loop_overlap_multi_batch()
+        
+        # Delete cache
+        for j in range(num_layers):
+            for k in range(num_batches):
+                self.delete_cache(j, k)
+                
+        self.env.cpu.del_attention_compute_workspace()
+        if tmp_batch_size is not None:
+            self.policy.gpu_batch_size = tmp_batch_size
 
+        return self.output_ids, self.logits
+    
     def generate(self,
                  inputs: Union[np.array, List[List[int]]],
                  max_new_tokens: int = 32,
@@ -849,6 +948,10 @@ class OptLM:
             temperature=temperature,
             stop=stop,
         )
+        tmp_batch_size = None
+        if self.policy.gpu_batch_size * self.num_gpu_batches != len(task.inputs):
+            tmp_batch_size = self.policy.gpu_batch_size
+            self.policy.gpu_batch_size = len(task.inputs)
         num_layers = self.num_layers
         num_gpu_batches = self.num_gpu_batches
         gpu_batch_size = self.policy.gpu_batch_size
@@ -915,6 +1018,8 @@ class OptLM:
                 self.delete_cache(j, k)
         if self.policy.cpu_cache_compute:
             self.env.cpu.del_attention_compute_workspace()
+        if tmp_batch_size is not None:
+            self.policy.gpu_batch_size = tmp_batch_size
 
         return self.output_ids
 

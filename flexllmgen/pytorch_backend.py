@@ -436,7 +436,7 @@ class TorchDevice:
             ids = torch.multinomial(probs, num_samples=1)
         else:
             ids = last_token_logits.argmax(dim=1, keepdim=True)
-        return TorchTensor.create_from_torch(ids, self)
+        return TorchTensor.create_from_torch(ids, self), TorchTensor.create_from_torch(logits, self)
 
     def init_cache_one_gpu_batch(self, config, task, policy):
         num_head, hidden_size, prompt_len, gen_len, gpu_batch_size = (

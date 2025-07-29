@@ -30,6 +30,8 @@ class Task:
     temperature: float
     stop: Optional[int]
 
+    logits: bool = False  # Whether to return logits for each token
+
 
 @dataclasses.dataclass(frozen=True)
 class ExecutionEnv:

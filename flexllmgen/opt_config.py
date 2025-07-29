@@ -230,8 +230,16 @@ def download_opt_weights(model_name, path):
     elif "galactica" in model_name:
         hf_model_name = "facebook/" + model_name
 
-    folder = snapshot_download(hf_model_name, allow_patterns="*.bin")
-    bin_files = glob.glob(os.path.join(folder, "*.bin"))
+    # folder = snapshot_download(hf_model_name, allow_patterns="*.bin")
+    # bin_files = glob.glob(os.path.join(folder, "*.bin"))
+    try:
+        bin_files = glob.glob(os.path.join(path, "*.bin"))
+        if not bin_files:
+            raise FileNotFoundError(f"No .bin files found in {path}")
+    except(FileNotFoundError, OSError) as e:
+        print(f"本地未找到.bin文件，从Hugging Face下载: {e}")
+        folder = snapshot_download(hf_model_name, allow_patterns="*.bin")
+        bin_files = glob.glob(os.path.join(folder, "*.bin"))
 
     if "/" in model_name:
         model_name = model_name.split("/")[1].lower()
