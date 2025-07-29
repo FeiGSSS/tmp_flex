@@ -38,15 +38,17 @@ class ExecutionEnv:
     cpu: Any = None
     disk: Any = None
     mixed: Any = None
+    numa: Any = None
 
-    @classmethod
-    def create(cls, offload_dir):
-        # fix recursive import
-        from flexllmgen.pytorch_backend import TorchDevice, TorchDisk, TorchMixedDevice
-        gpu = TorchDevice("cuda:0")
-        cpu = TorchDevice("cpu")
-        disk = TorchDisk(offload_dir)
-        return cls(gpu=gpu, cpu=cpu, disk=disk, mixed=TorchMixedDevice([gpu, cpu, disk]))
+    # @classmethod
+    # def create(cls, offload_dir):
+    #     # fix recursive import
+    #     from flexllmgen.pytorch_backend import TorchDevice, TorchDisk, TorchMixedDevice
+    #     gpu = TorchDevice("cuda:0")
+    #     cpu = TorchDevice("cpu")
+    #     disk = TorchDisk(offload_dir)
+    #     numa = TorchDevice("numa")
+    #     return cls(gpu=gpu, cpu=cpu, disk=disk, mixed=TorchMixedDevice([gpu, cpu, disk]), numa=numa)
 
     def close_copy_threads(self):
         self.disk.close_copy_threads()

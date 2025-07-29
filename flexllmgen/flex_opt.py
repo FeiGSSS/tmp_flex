@@ -17,13 +17,15 @@ from transformers import AutoTokenizer
 
 from flexllmgen.compression import CompressionConfig
 from flexllmgen.opt_config import OptConfig, get_opt_config, download_opt_weights
-from flexllmgen.pytorch_backend import (TorchDevice, TorchDisk, TorchLink,
+from flexllmgen.pytorch_backend import (TorchDevice, TorchDisk, TorchLink, TorchNuma,
     TorchMixedDevice, DeviceType, general_copy, fix_recursive_import)
 from flexllmgen.timer import timers
 from flexllmgen.utils import (Task, ExecutionEnv, GB, T, ValueHolder,
     array_1d, array_2d, array_3d, str2bool, project_decode_latency,
     torch_mem_stats, torch_dtype_to_np_dtype, write_benchmark_log,
     read_benchmark_log)
+
+from flexllmgen.pytorch_backend import print_memory_copy_stats
 
 fix_recursive_import()
 
@@ -38,10 +40,13 @@ class Policy:
     # percent = a means a%
     w_gpu_percent: float
     w_cpu_percent: float
+    w_numa_percent: float
     cache_gpu_percent: float
     cache_cpu_percent: float
+    cache_numa_percent: float
     act_gpu_percent: float
     act_cpu_percent: float
+    act_numa_percent: float
 
     # Whether to overlap the I/O and compute
     overlap: bool
@@ -68,15 +73,15 @@ class Policy:
 
     @property
     def w_disk_percent(self):
-        return 100 - self.w_gpu_percent - self.w_cpu_percent
+        return 100 - self.w_gpu_percent - self.w_cpu_percent - self.w_numa_percent
 
     @property
     def cache_disk_percent(self):
-        return 100 - self.cache_gpu_percent - self.cache_cpu_percent
+        return 100 - self.cache_gpu_percent - self.cache_cpu_percent - self.cache_numa_percent
 
     @property
     def act_disk_percent(self):
-        return 100 - self.act_gpu_percent - self.act_cpu_percent
+        return 100 - self.act_gpu_percent - self.act_cpu_percent - self.act_numa_percent
 
 
 def get_choice(cur_percent, percents, choices):
@@ -90,8 +95,8 @@ def get_choice(cur_percent, percents, choices):
 
 
 def init_weight_list(weight_specs, policy, env):
-    dev_percents = [policy.w_disk_percent, policy.w_cpu_percent, policy.w_gpu_percent]
-    dev_choices = [env.disk, env.cpu, env.gpu]
+    dev_percents = [policy.w_disk_percent, policy.w_cpu_percent, policy.w_gpu_percent, policy.w_numa_percent]
+    dev_choices = [env.disk, env.cpu, env.gpu, env.numa]
 
     sizes = [np.prod(spec[0]) for spec in weight_specs]
     sizes_cumsum = np.cumsum(sizes)
@@ -325,8 +330,10 @@ class SelfAttention:
             device = self.env.cpu
         elif self.policy.cache_disk_percent == 100:
             device = self.env.disk
+        elif self.policy.cache_numa_percent == 100:
+            device = self.env.numa
         else:
-            device = self.env.mixed
+            raise NotImplementedError()
 
         if self.policy.compress_cache:
             assert device.device_type != DeviceType.MIXED
@@ -611,6 +618,8 @@ class OptLM:
             self.act_home = self.env.cpu
         elif self.policy.act_disk_percent == 100:
             self.act_home = self.env.disk
+        elif self.policy.act_numa_percent == 100:
+            self.act_home = self.env.numa
         else:
             raise NotImplementedError()
 
@@ -1192,12 +1201,13 @@ def run_flexllmgen(args):
     gpu = TorchDevice("cuda:0")
     cpu = TorchDevice("cpu")
     disk = TorchDisk(args.offload_dir)
-    env = ExecutionEnv(gpu=gpu, cpu=cpu, disk=disk, mixed=TorchMixedDevice([gpu, cpu, disk]))
+    numa = TorchNuma()
+    env = ExecutionEnv(gpu=gpu, cpu=cpu, disk=disk, numa=numa, mixed=TorchMixedDevice([gpu, cpu, disk]))
 
     policy = Policy(args.gpu_batch_size, args.num_gpu_batches,
-                    args.percent[0], args.percent[1],
-                    args.percent[2], args.percent[3],
-                    args.percent[4], args.percent[5],
+                    args.percent[0], args.percent[1], args.percent[2],
+                    args.percent[3], args.percent[4], args.percent[5],
+                    args.percent[6], args.percent[7], args.percent[8],
                     args.overlap, args.sep_layer, args.pin_weight,
                     args.cpu_cache_compute, args.attn_sparsity,
                     args.compress_weight,
@@ -1219,9 +1229,9 @@ def run_flexllmgen(args):
     model = OptLM(opt_config, env, args.path, policy)
 
     try:
-        print("warmup - generate")
-        output_ids = model.generate(
-            warmup_inputs, max_new_tokens=1, verbose=args.verbose)
+        # print("warmup - generate")
+        # output_ids = model.generate(
+        #     warmup_inputs, max_new_tokens=1, verbose=args.verbose)
 
         print("benchmark - generate")
         timers("generate").reset()
@@ -1270,6 +1280,8 @@ def run_flexllmgen(args):
         decode_latency, decode_throughput, total_latency, total_throughput)
     if args.verbose >= 1:
         print(log_str)
+    
+    print_memory_copy_stats()
 
 
 def add_parser_arguments(parser):
@@ -1286,17 +1298,20 @@ def add_parser_arguments(parser):
         help="Cut generation length for fast debugging.")
     parser.add_argument("--debug-mode", type=str,
         choices=["fewer_batch", "breakdown"])
-    parser.add_argument("--gpu-batch-size", type=int, default=4)
+    parser.add_argument("--gpu-batch-size", type=int, default=26)
     parser.add_argument("--num-gpu-batches", type=int, default=1)
     parser.add_argument("--percent", nargs="+", type=int,
-        default=[100, 0, 100, 0, 100, 0],
-        help="Six numbers. They are "
+        default=[100, 0, 0, 100, 0, 0, 100, 0, 0],
+        help="Nine numbers. They are "
          "the percentage of weight on GPU, "
          "the percentage of weight on CPU, "
+         "the percentage of weight on NUMA, "
          "the percentage of attention cache on GPU, "
          "the percentage of attention cache on CPU, "
+         "the percentage of attention cache on NUMA, "
          "the percentage of activations on GPU, "
-         "the percentage of activations on CPU")
+         "the percentage of activations on CPU, "
+         "the percentage of activations on NUMA")
     parser.add_argument("--sep-layer", type=str2bool, nargs='?',
         const=True, default=True)
     parser.add_argument("--pin-weight", type=str2bool, nargs="?",
@@ -1318,10 +1333,13 @@ def add_parser_arguments(parser):
 
 
 if __name__ == "__main__":
+    import torch
+    torch.set_num_threads(20)
+    
     parser = argparse.ArgumentParser()
     add_parser_arguments(parser)
     args = parser.parse_args()
 
-    assert len(args.percent) == 6
+    assert len(args.percent) == 9
 
     run_flexllmgen(args)

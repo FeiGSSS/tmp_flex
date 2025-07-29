@@ -17,6 +17,86 @@ from flexllmgen.utils import (GB, T, cpu_mem_stats, vector_gather,
     np_dtype_to_torch_dtype, torch_dtype_to_np_dtype,
     torch_dtype_to_num_bytes)
 
+from flexllmgen.libnuma import libnuma
+from concurrent.futures import ThreadPoolExecutor
+import ctypes
+
+
+class MemCopy:
+    def __init__(self):
+        self.parallel_threshold = 64 * 1024 * 1024
+        self.num_threads = 8
+        self.stats = {
+            'total_copies': 0,
+            'optimized_copies': 0,
+            'total_bytes': [],
+            'optimized_bytes': []
+        }
+    
+    def memmove(self, dst_ptr: int, src_ptr: int, size: int):
+        self.stats['total_copies'] += 1
+        self.stats['total_bytes'].append(size)
+
+        # print(f"MemCopy: Moving {size / (1024**2):.2f} MB")    
+        
+        if size < self.parallel_threshold:
+            ctypes.memmove(ctypes.c_void_p(dst_ptr), 
+                          ctypes.c_void_p(src_ptr), 
+                          ctypes.c_size_t(size))
+            return
+        
+        self.stats['optimized_copies'] += 1
+        self.stats['optimized_bytes'].append(size)
+
+        num_threads = min(self.num_threads, os.cpu_count())
+        
+        chunk_size = size // num_threads
+        
+        def copy_chunk(thread_id):
+            start_offset = thread_id * chunk_size
+            if thread_id == num_threads - 1:
+                copy_size = size - start_offset
+            else:
+                copy_size = chunk_size
+            
+            dst_chunk = int(dst_ptr) + int(start_offset)
+            src_chunk = int(src_ptr) + int(start_offset)
+            
+            if dst_chunk < 0 or src_chunk < 0:
+                raise ValueError(f"Invalid pointer calculation: dst={dst_chunk}, src={src_chunk}")
+            
+            ctypes.memmove(ctypes.c_void_p(dst_chunk), 
+                           ctypes.c_void_p(src_chunk), 
+                           ctypes.c_size_t(copy_size))
+        
+        with ThreadPoolExecutor(max_workers=num_threads) as executor:
+            futures = [executor.submit(copy_chunk, i) for i in range(num_threads)]
+            for future in futures:
+                future.result()
+    
+    def get_stats(self):
+        return self.stats.copy()
+    
+    def print_stats(self):
+        stats = self.get_stats()
+        opt_ratio = (stats['optimized_copies'] / max(stats['total_copies'], 1)) * 100
+        opt_bytes_ratio = (sum(stats['optimized_bytes']) / max(sum(stats['total_bytes']), 1)) * 100
+        ave_bytes = sum(stats['total_bytes']) / max(stats['total_copies'], 1)
+        ave_opt_bytes = sum(stats['optimized_bytes']) / max(stats['optimized_copies'], 1)
+
+        print(f"Memory Copy Optimization Stats:")
+        print(f"  Total copies: {stats['total_copies']}")
+        print(f"  Optimized copies: {stats['optimized_copies']} ({opt_ratio:.1f}%)")
+        print(f"  Total bytes: {sum(stats['total_bytes']) / (1024**3):.2f} GB")
+        print(f"  Optimized bytes: {sum(stats['optimized_bytes']) / (1024**3):.2f} GB ({opt_bytes_ratio:.1f}%)")
+        print(f"  Average bytes per copy: {ave_bytes / (1024**2):.2f} MB")
+        print(f"  Average bytes per optimized copy: {ave_opt_bytes / (1024**2):.2f} MB")
+
+memcopy = MemCopy()
+
+def print_memory_copy_stats():
+    memcopy.print_stats()
+
 general_copy_compressed = TorchCompressedDevice = None
 global_cpu_device = None
 global_disk_device = None
@@ -35,6 +115,7 @@ class DeviceType(Enum):
     DISK = auto()
     MIXED = auto()
     COMPRESSED = auto()
+    NUMA = auto()
 
     @staticmethod
     def convert(name):
@@ -48,6 +129,8 @@ class DeviceType(Enum):
             return DeviceType.MIXED
         elif name == "compressed":
             return DeviceType.COMPRESSED
+        elif name == "numa":
+            return DeviceType.NUMA
         else:
             raise ValueError(f"Invalid name: {name}")
 
@@ -104,12 +187,18 @@ class TorchTensor:
         assert self.device is not None, "already deleted"
         if self.device.device_type == DeviceType.DISK:
             self.device.delete(self)
+        if self.device.device_type == DeviceType.NUMA:
+            self.device.delete(self)
         self.device = self.data = None
 
     def load_from_np(self, np_array):
         if self.device.device_type == DeviceType.DISK:
             with open(self.data, "wb") as fout:
                 np.save(fout, np_array)
+        elif self.device.device_type == DeviceType.NUMA:
+            ptr, byte_size, shape, dtype = self.data
+            assert np_array.flags.c_contiguous, "NUMA tensor must be C-contiguous"
+            memcopy.memmove(ptr, np_array.ctypes.data, byte_size)
         else:
             if self.device.device_type == DeviceType.COMPRESSED:
                 tmp = torch.from_numpy(np_array)
@@ -154,6 +243,71 @@ class TorchTensor:
     def __str__(self):
         return (f"TorchTensor(shape={self.shape}, dtype={str(self.dtype)}, "
                 f"device={self.device.name if self.device else None})")
+        
+class TorchNuma:
+    """Manage tensors stored on a NUMA node."""
+    def __init__(self, numa_node: int=2):
+        self.numa_node = numa_node
+        self._metadata = {}  # {key: (ptr_as_int, byte_size, shape, dtype)}
+        self._lock = threading.Lock()
+        self.device_type: DeviceType = DeviceType.NUMA
+        self.dev = None
+        
+    def allocate(self, shape, dtype, pin_memory=None, name=None) -> TorchTensor:
+        """
+        Allocate a tensor on a NUMA node.
+        """
+        name = name or TorchTensor.next_name()
+        byte_size = np.prod(shape) * torch_dtype_to_num_bytes[np_dtype_to_torch_dtype[dtype]]
+        ptr = libnuma.alloc_onnode(byte_size, self.numa_node)
+        if ptr is None:
+            raise MemoryError(f"Failed to allocate {byte_size} bytes on NUMA node {self.numa_node}")
+        self._metadata[name] = (ptr, byte_size, shape, dtype)
+        
+        return TorchTensor(shape,
+                           np_dtype_to_torch_dtype[dtype],
+                           (ptr, byte_size, shape, dtype),
+                           self,
+                           name=name)
+        
+
+    def delete(self, tensor: TorchTensor) -> None:
+        with self._lock:
+            if tensor.name not in self._metadata:
+                raise ValueError(f"Tensor {tensor.name} not found in NUMA metadata.")
+            ptr, byte_size, _, _ = self._metadata.pop(tensor.name)
+            libnuma.free(ptr, byte_size)
+        
+            
+    def init_cache_one_gpu_batch(self, config, task, policy) -> TorchTensor:
+        """
+        Initialize a cache for one batch on disk.
+        """
+        n_head = config.n_head
+        hidden_size = config.input_dim
+        prompt_len = task.prompt_len
+        gen_len = task.gen_len
+        batch_size = policy.gpu_batch_size
+        
+        shape = (prompt_len + gen_len - 1, batch_size * n_head, hidden_size // n_head)
+        k_cache = self.allocate(shape, np.float16)
+        v_cache = self.allocate(shape, np.float16)
+        return k_cache, v_cache
+    
+    def mem_stats(self):
+        raise NotImplementedError("NUMA memory stats not implemented")
+    
+    def print_stats(self, output_file=None):
+        raise NotImplementedError("NUMA print stats not implemented")
+
+    def __del__(self):
+        if not hasattr(self, '_metadata') or not hasattr(self, '_lock'):
+            return
+        with self._lock: # Ensure thread safety when freeing memory
+            keys = list(self._metadata.keys())
+            for key in keys:
+                ptr, byte_size, _, _ = self._metadata.pop(key)
+                libnuma.free(ptr, byte_size)
 
 
 class TorchDevice:
@@ -209,8 +363,8 @@ class TorchDevice:
             # so we only need one workspace instead of two.
             for i in range(1 if policy.sep_layer else 2):
                 shape = (max_seq_len, b * n_head, head_dim)
-                k_cache = self.allocate(shape, np.float32, pin_memory=False)
-                v_cache = self.allocate(shape, np.float32, pin_memory=False)
+                k_cache = self.allocate(shape, np.float16, pin_memory=False)
+                v_cache = self.allocate(shape, np.float16, pin_memory=False)
                 self.attention_compute_workspace.append((k_cache, v_cache))
         else:
             self.compressed_device.init_attention_compute_workspace(
@@ -782,8 +936,8 @@ class TorchLink:
         else:
             raise ValueError(f"Invalid source {src}")
 
-        if force_io_time is not None:
-            return force_io_time
+        # if force_io_time is not None:
+        #     return force_io_time
 
         return size / bandwidth
 
@@ -837,8 +991,11 @@ def general_copy(dst: TorchTensor, dst_indices: Tuple[slice],
     elif (src.device.device_type == DeviceType.CUDA and
           dst.device.device_type == DeviceType.CPU and
           not dst.data.is_pinned() and src.shape[0] > 1):
-        # The cpu tensor is not pinned, dispatch to copy threads and use pin_memory
-        # as a relay
+        # The cpu tensor is not pinned, dispatch to copy threads and use pin_memory as a relay
+        global_disk_device.submit_copy(dst, dst_indices, src, src_indices)
+    elif (src.device.device_type == DeviceType.NUMA or 
+            dst.device.device_type == DeviceType.NUMA):
+        # The tensor is on NUMA, dispatch to copy threads for asynchronous copy
         global_disk_device.submit_copy(dst, dst_indices, src, src_indices)
     elif (src.device.device_type == DeviceType.CPU and
           dst.device.device_type == DeviceType.CUDA and
@@ -890,17 +1047,70 @@ def copy_worker_func(queue, cuda_id):
                 return
 
             dst, dst_indices, src, src_indices = item
-            src_data = map_to_torch_tensor(src, src_indices)
-            dst_data = map_to_torch_tensor(dst, dst_indices)
-
-            if (src.device.device_type == DeviceType.CUDA or
-                dst.device.device_type == DeviceType.CUDA):
-                # Use a pinned cpu buffer as a relay
+            if dst.device.device_type == DeviceType.NUMA:
+                assert src.device.device_type != DeviceType.NUMA
+                src_data = map_to_torch_tensor(src, src_indices)
                 size = np.prod(src_data.shape)
-                tmp_cpu_buf = cpu_buf[:size].view(src_data.shape)
-                tmp_cpu_buf.copy_(src_data)
-                dst_data.copy_(tmp_cpu_buf)
+                # 1️⃣  from CUDA to NUMA
+                if src.device.device_type == DeviceType.CUDA:
+                    # Use a pinned cpu buffer as a relay
+                    tmp_cpu_buf = cpu_buf[:size].view(src_data.shape)
+                    tmp_cpu_buf.copy_(src_data)
+                    ptr, byte_size, shape, dtype = dst.data
+                    assert byte_size >= size * src_data.element_size()
+                    # assert byte_size == size * src_data.element_size(), f"Expected {size * src_data.element_size()} bytes, \
+                    #                                     got {byte_size} bytes. shape={shape}, dtype={dtype} \
+                    #                                         src_data.shape={src_data.shape}, size={size} \
+                    #                                             src_data.element_size()={src_data.element_size()} \
+                    #                                                 dst.data={dst.data}"
+                    memcopy.memmove(dst_ptr=ptr,
+                                    src_ptr=tmp_cpu_buf.data_ptr(),
+                                    size=size * src_data.element_size())
+                # 2️⃣ from CPU to NUMA
+                else: 
+                    assert src_data.contiguous()
+                    ptr, byte_size, shape, dtype = dst.data
+                    assert byte_size >= size * src_data.element_size()
+                    memcopy.memmove(dst_ptr=ptr,
+                                    src_ptr=src_data.data_ptr(),
+                                    size=size * src_data.element_size())
+                
+            elif src.device.device_type == DeviceType.NUMA:
+                assert dst.device.device_type != DeviceType.NUMA
+                dst_data = map_to_torch_tensor(dst, dst_indices)
+                # 3️⃣ from NUMA to CUDA
+                if dst.device.device_type == DeviceType.CUDA:
+                    # Use a pinned cpu buffer as a relay
+                    size = np.prod(dst_data.shape)
+                    tmp_cpu_buf = cpu_buf[:size].view(dst_data.shape)
+                    ptr, byte_size, shape, dtype = src.data
+                    assert byte_size >= size * dst_data.element_size()
+                    memcopy.memmove(dst_ptr=tmp_cpu_buf.data_ptr(),
+                                    src_ptr=ptr,
+                                    size=size * dst_data.element_size())
+                    dst_data.copy_(tmp_cpu_buf)
+                # 4️⃣ from NUMA to CPU
+                else:
+                    assert dst_data.contiguous()
+                    ptr, byte_size, shape, dtype = src.data
+                    size = np.prod(dst_data.shape)
+                    assert byte_size >= size * dst_data.element_size()
+                    memcopy.memmove(dst_ptr=dst_data.data_ptr(),
+                                    src_ptr=ptr,
+                                    size=size * dst_data.element_size())
+            # 5️⃣ from DISK to CUDA/CPU or vice versa
             else:
-                dst_data.copy_(src_data)
+                src_data = map_to_torch_tensor(src, src_indices)
+                dst_data = map_to_torch_tensor(dst, dst_indices)
+
+                if (src.device.device_type == DeviceType.CUDA or
+                    dst.device.device_type == DeviceType.CUDA):
+                    # Use a pinned cpu buffer as a relay
+                    size = np.prod(src_data.shape)
+                    tmp_cpu_buf = cpu_buf[:size].view(src_data.shape)
+                    tmp_cpu_buf.copy_(src_data)
+                    dst_data.copy_(tmp_cpu_buf)
+                else:
+                    dst_data.copy_(src_data)
 
             queue.task_done()
