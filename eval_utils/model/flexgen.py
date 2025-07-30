@@ -131,8 +131,8 @@ class flexgen(TemplateLM):
 
                 # gpus = torch.cuda.device_count() # when use gpu, use this
                 # 由于移除了 Accelerate 的分布式初始化，这里直接设置设备
-            self._device = device
-            eval_logger.info(f"{self._device}, and {args.device}")
+            self._device = args.device if args.device is not None else device
+            eval_logger.info(f"{self._device}, and flexllmgen use device GPU CPU and Disk, so set cuda")
 
             revision = str(revision)  # cast to string if not already one
 

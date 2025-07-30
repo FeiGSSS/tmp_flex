@@ -278,32 +278,48 @@ def get_model(
         model_args: Optional[str] = None,
 ):
     assert isinstance(args.model_type, str), "model_type must be a string"
-    if args.model_type in ["flexllmgen", "flexllmgen_gpu", "flexllmgen-gpu", "flexllmgen_cxl", "flexllmgen-cxl"]:
-        eval_logger.info(
-                f"Initializing {args.model_type} model, with arguments: {simple_parse_args_string(model_args)}"
-            )
-        args.device = "flexllmgen use device GPU CPU and Disk, so set cuda"
-        lm = eval_utils.api.registry.get_model(args.model_type).create_from_arg_string(
-            model_args,
-            {"args": args}
-        )
-    else:
-        if model_args is None:
+    if model_args is None:
             eval_logger.warning("model_args not specified. Using defaults.")
             model_args = ""
-        else:
-            assert args.device in [None, "cpu", "cuda"], f"device is {args.device},  should be assigned in  [None, 'cpu', 'cuda']"
-            eval_logger.info(
-                f"Initializing {args.model_type} model, with arguments: {simple_parse_args_string(model_args)}"
-            )
-            lm = eval_utils.api.registry.get_model(args.model_type).create_from_arg_string(
-                model_args,
-                {
-                    "batch_size": args.gpu_batch_size,
-                    "max_batch_size": args.gpu_batch_size,
-                    "device": args.device,
-                },
-            )
+    else:
+        assert args.device in [None, "cpu"] or "cuda" in args.device, f"device is {args.device},  should be assigned in  [None, 'cpu', 'cuda/cuda:N']"
+        eval_logger.info(
+            f"Initializing {args.model_type} model, with arguments: {simple_parse_args_string(model_args)}"
+        )
+        lm = eval_utils.api.registry.get_model(args.model_type).create_from_arg_string(
+            model_args,
+            {
+                "batch_size": args.gpu_batch_size,
+                "max_batch_size": args.gpu_batch_size,
+                "device": args.device,
+            },
+        )
+    # if args.model_type in ["flexllmgen", "flexllmgen_gpu", "flexllmgen-gpu", "flexllmgen_cxl", "flexllmgen-cxl"]:
+    #     eval_logger.info(
+    #             f"Initializing {args.model_type} model, with arguments: {simple_parse_args_string(model_args)}"
+    #         )
+    #     args.device = "flexllmgen use device GPU CPU and Disk, so set cuda"
+    #     lm = eval_utils.api.registry.get_model(args.model_type).create_from_arg_string(
+    #         model_args,
+    #         {"args": args}
+    #     )
+    # else:
+    #     if model_args is None:
+    #         eval_logger.warning("model_args not specified. Using defaults.")
+    #         model_args = ""
+    #     else:
+    #         assert args.device in [None, "cpu", "cuda"], f"device is {args.device},  should be assigned in  [None, 'cpu', 'cuda']"
+    #         eval_logger.info(
+    #             f"Initializing {args.model_type} model, with arguments: {simple_parse_args_string(model_args)}"
+    #         )
+    #         lm = eval_utils.api.registry.get_model(args.model_type).create_from_arg_string(
+    #             model_args,
+    #             {
+    #                 "batch_size": args.gpu_batch_size,
+    #                 "max_batch_size": args.gpu_batch_size,
+    #                 "device": args.device,
+    #             },
+    #         )
     if args.use_cache is not None:
         eval_logger.info(f"Using cache at {args.use_cache + '_rank' + str(lm.rank) + '.db'}")
         lm = eval_utils.api.model.CachingLM(
