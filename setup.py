@@ -34,7 +34,7 @@ setup(
 
     packages=find_packages(
         where='.',  # 从当前目录开始查找
-        include=['flexllmgen*', 'eval_utils*'] # 明确包含这两个路径作为包
+        include=['flexllmgen*', 'flexgen*', 'eval_utils*'] # 明确包含这两个路径作为包
     ),
     
     # 如果你想让 `eval_utils` 包在安装后直接以 `import eval_utils` 导入，
