@@ -125,7 +125,7 @@ class flexgen(TemplateLM):
             self._config = self._model.config
             
         else:
-            assert isinstance(args.device, str)
+            assert isinstance(args.device, str) or isinstance(device, str)
             assert isinstance(args.model_type, str)
             assert isinstance(args.gpu_batch_size, (int, str))
 

@@ -286,14 +286,20 @@ def get_model(
         eval_logger.info(
             f"Initializing {args.model_type} model, with arguments: {simple_parse_args_string(model_args)}"
         )
-        lm = eval_utils.api.registry.get_model(args.model_type).create_from_arg_string(
+        if args.model_type in ["flexllmgen", "flexllmgen_gpu", "flexllmgen-gpu", "flexllmgen_cxl", "flexllmgen-cxl"]:
+            lm = eval_utils.api.registry.get_model(args.model_type).create_from_arg_string(
             model_args,
-            {
-                "batch_size": args.gpu_batch_size,
-                "max_batch_size": args.gpu_batch_size,
-                "device": args.device,
-            },
+            {"args": args}
         )
+        else:
+            lm = eval_utils.api.registry.get_model(args.model_type).create_from_arg_string(
+                model_args,
+                {
+                    "batch_size": args.gpu_batch_size,
+                    "max_batch_size": args.gpu_batch_size,
+                    "device": args.device,
+                },
+            )
     # if args.model_type in ["flexllmgen", "flexllmgen_gpu", "flexllmgen-gpu", "flexllmgen_cxl", "flexllmgen-cxl"]:
     #     eval_logger.info(
     #             f"Initializing {args.model_type} model, with arguments: {simple_parse_args_string(model_args)}"
