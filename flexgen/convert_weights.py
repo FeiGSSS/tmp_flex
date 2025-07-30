@@ -11,6 +11,7 @@ from tqdm import tqdm
 from safetensors.torch import load_file as load_safetensors
 from torch import load as load_bin
 from gguf import GGUFReader
+import shutil
 
 # 导入上面定义的配置系统
 from flexgen.model_config import FlexModelConfigFactory
@@ -79,6 +80,7 @@ def save_param_as_numpy(param, output_dir, flexgen_name):
     with open(param_path, "wb") as f:
         np.save(f, param_np)
 
+
 def convert(model_path: str, output_path: str):
     """执行完整的模型转换流程"""
     # 1. 智能加载权重和配置
@@ -106,6 +108,10 @@ def convert(model_path: str, output_path: str):
     for raw_name, param in tqdm(state_dict.items(), desc="Converting Tensors"):
 
         save_param_as_numpy(param, output_path, raw_name)
+            # shared embedding
+        # if "embed_tokens.weight" in raw_name:
+        #     shutil.copy(output_path, output_path.replace(
+        #         "decoder.embed_tokens.weight", "lm_head.weight"))
         
     # --- 步骤 2: 构建并保存 weight_map.json ---
     print("Building weight map manifest...")
@@ -127,17 +133,24 @@ def convert(model_path: str, output_path: str):
                     component = 'attention' if 'attn' in flexgen_name_template else 'mlp'
                     standard_name = flexgen_name_template.split('_', 1)[1]
                     # 在清单中记录此权重的原始文件名
-                    weight_map['layers'][i][component][standard_name] = raw_name
+                    if raw_name.replace('weight', 'bias') in state_dict:
+                        weight_map['layers'][i][component][standard_name] = [raw_name, raw_name.replace('weight', 'bias')]
+                    else:
+                        weight_map['layers'][i][component][standard_name] = [raw_name]
         else: # 处理非循环/全局权重
             raw_name = raw_name_template
             if raw_name in state_dict:
                 # 在清单中记录此权重的原始文件名
-                weight_map[flexgen_name_template] = raw_name
-    
+                if raw_name.replace('weight', 'bias') in state_dict:
+                    weight_map[flexgen_name_template] = [raw_name, raw_name.replace('weight', 'bias')] 
+                else:
+                    weight_map[flexgen_name_template] = [raw_name] 
+
     # --- 步骤 3: 保存 config 和 weight_map ---
     with open(Path(output_path) / "weight_map.json", "w") as f:
         json.dump(weight_map, f, indent=2)
     config_save_path = Path(output_path) / f"flexgen_config.pkl"
     with open(config_save_path, "wb") as f:
         pickle.dump(config, f)
+        # json.dump(config, f, indent=2)
     print(f"FlexGen config saved to {config_save_path}")

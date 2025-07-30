@@ -8,13 +8,14 @@ from typing import Dict, Any
 
 from huggingface_hub import hf_hub_download
 
-@dataclasses.dataclass
+@dataclasses.dataclass(init=False, kw_only=True)
 class FlexModelConfig:
     """ 
     统一模型架构描述。
     这个类的实例将包含运行一个特定模型所需的所有架构信息和权重命名规则。
     """
     # --- 尺寸参数 ---
+    input_dim: int
     hidden_size: int
     num_attention_heads: int
     num_hidden_layers: int
@@ -32,6 +33,35 @@ class FlexModelConfig:
     # Key = FlexGen内部标准名, Value = 来源框架中的原始名
     # 使用 {i} 作为层号的占位符
     layer_name_map: Dict[str, str]
+    def __init__(self, **kwargs):
+            # 1. 先检查并设置所有显式定义的核心字段
+            required_fields = [field.name for field in dataclasses.fields(self)]
+            for field in required_fields:
+                if field not in kwargs:
+                    raise TypeError(f"缺少必填参数: {field}")
+                setattr(self, field, kwargs[field])  # 设置核心字段
+
+            # 2. 将所有参数（包括核心字段和额外字段）存入实例的__dict__
+            # 这样可以通过config.xxx直接访问所有参数
+            self.__dict__.update(kwargs) 
+    def model_bytes(self):
+        h = self.input_dim
+        return 	2 * (self.num_hidden_layers * (
+        # self-attention
+        h * (3 * h + 1) + h * (h + 1) +
+        # mlp
+        h * (4 * h + 1) + h * 4 * (h + 1) +
+        # layer norm
+        h * 4) +
+        # embedding
+        self.vocab_size * (h + 1))
+
+    def cache_bytes(self, batch_size, seq_len):
+        return 2 * batch_size * seq_len * self.num_hidden_layers * self.input_dim * 2
+
+    def hidden_bytes(self, batch_size, seq_len):
+        return batch_size * seq_len * self.input_dim * 2
+    
 
     def get_layer_name(self, flexgen_name: str, layer_idx: int = None) -> str:
         """根据FlexGen标准名和层号获取原始名"""
@@ -50,14 +80,23 @@ class FlexModelConfigFactory:
     @staticmethod
     def from_hf_config(config: dict) -> FlexModelConfig:
         model_type = config.get("model_type")
-        
+        explicit_params = {
+                            "model_type", "hidden_size", "num_attention_heads", 
+                            "num_hidden_layers", "vocab_size", "num_key_value_heads",
+                            "rms_norm_eps", "mlp_type", "normalization_type",
+                            "positional_embedding_type", "layer_name_map", 
+                        }
+        filtered_config = {k: v for k, v in config.items() if k not in explicit_params}
+
         # LLaMA, DeepSeek, Qwen2 等现代模型架构高度相似
         if model_type in ["llama", "deepseek", "qwen2", "mistral"]:
             return FlexModelConfig(
+                input_dim=config["hidden_size"],
                 model_type=model_type,
                 hidden_size=config["hidden_size"],
                 num_attention_heads=config["num_attention_heads"],
                 num_hidden_layers=config["num_hidden_layers"],
+                
                 vocab_size=config["vocab_size"],
                 num_key_value_heads=config.get("num_key_value_heads", config["num_attention_heads"]),
                 rms_norm_eps=config["rms_norm_eps"],
@@ -77,10 +116,12 @@ class FlexModelConfigFactory:
                     "mlp_down_proj": "model.layers.{i}.mlp.down_proj.weight",
                     "attn_norm": "model.layers.{i}.input_layernorm.weight",
                     "mlp_norm": "model.layers.{i}.post_attention_layernorm.weight",
-                }
+                }, 
+                **filtered_config, 
             )
         elif model_type == "opt":
             return FlexModelConfig(
+                input_dim=config["hidden_size"],
                 model_type=model_type,
                 hidden_size=config["hidden_size"],
                 num_attention_heads=config["num_attention_heads"],
@@ -104,7 +145,8 @@ class FlexModelConfigFactory:
                     "mlp_fc2": "model.decoder.layers.{i}.fc2.weight", # OPT specific
                     "attn_norm": "model.decoder.layers.{i}.self_attn_layer_norm.weight",
                     "mlp_norm": "model.decoder.layers.{i}.final_layer_norm.weight", # Renamed for consistency
-                }
+                }, 
+                **filtered_config,
             )
         elif model_type == "chatglm":
             # ChatGLM (v2/v3) 的实现细节（如QueryKeyValuen一体的权重）需要特别处理
