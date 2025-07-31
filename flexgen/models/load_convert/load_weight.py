@@ -4,13 +4,14 @@
 # ==============================================================================
 import os
 import pickle
+import json
 from pathlib import Path
 # from flex_model import FlexModel # 假设这是重构后的主引擎文件
-from flexgen.convert_weights import convert # 导入转换函数
+from flexgen.models.load_convert.convert_weights import convert # 导入转换函数
 
 class AutoFlexModel:
     @staticmethod
-    def from_pretrained(model_path: str, policy, env, force_convert: bool = False):
+    def from_pretrained(model_path: str, force_convert: bool = False):
         """
         统一加载入口。自动处理转换和加载。
         
@@ -39,6 +40,12 @@ class AutoFlexModel:
         print(f"Loading FlexGen config from {config_path}")
         with open(config_path, "rb") as f:
             config = pickle.load(f)
+        
+        # 3. 加载已转换的 FlexModelConfig
+        weight_map_path = converted_path / "weight_map.json"
+        print(f"Loading FlexGen config from {weight_map_path}")
+        with open(weight_map_path, "r") as f:
+            weight_map = json.load(f)
             
         # 3. 实例化通用的 FlexModel 引擎
         # 注意: 这里的 FlexModel 需要您根据指南重构 flex_opt.py
@@ -46,6 +53,6 @@ class AutoFlexModel:
         # print(f"Successfully loaded model '{model_name}' with FlexGen.")
         
         # return model
-        print("--- Placeholder: FlexModel instantiation ---")
-        print("Please replace this with your refactored FlexModel class.")
-        return config, str(converted_path) # 返回配置和路径作为演示
+        # print("--- Placeholder: FlexModel instantiation ---")
+        # print("Please replace this with your refactored FlexModel class.")
+        return config, str(converted_path), weight_map # 返回配置和路径作为演示

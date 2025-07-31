@@ -1,19 +1,25 @@
 from pathlib import Path
 import numpy as np
-from typing import Any, List, Union
+import dataclasses
+from typing import Any, List, Union, Optional
 import torch
 from tqdm import tqdm
 
-from flexgen.utils import (ValueHolder, ExecutionEnv, 
-                           array_1d, array_2d, array_3d
+from flexgen.utils import (ValueHolder, 
+                           array_1d, array_2d, array_3d, array_4d
                            )
+# from flexgen.compression import CompressionConfig
 from flexgen.timer import timers
 from flexgen.models.config import FlexModelConfig
-from flexgen.flex_model import Policy
+from flexgen.models.utils import ExecutionEnv, Policy, Task
+# from flexgen.flex_model import Policy
 
 # 假设这些依赖项在您的主项目中可用
 # from flex_model_config import FlexModelConfig
 # from flex_model import Policy, init_weight_list
+
+# timers = Timers()
+
 
 class BaseModelLayer:
     """所有模型层的基类，共享通用属性。"""
@@ -26,9 +32,9 @@ class BaseModelLayer:
         self.env = env
         self.policy = policy
         self.weight_map = weight_map
-        self.compute = self.env.gpu
-        self.weight_load_dst = (self.compute.compressed_device if policy.compress_weight
-            else self.compute)
+        self.compute_device = self.env.gpu
+        self.weight_load_dst = (self.compute_device.compressed_device if policy.compress_weight
+            else self.compute_device)
         self.task = None
 
     def set_task(self, task):
@@ -43,7 +49,7 @@ class BaseModelLayer:
     def load_weight(self, 
                     weight_home:ValueHolder, 
                     weight_read_buf:ValueHolder, 
-                    k:Any[int, float]):
+                    k:List[Union[int, float]]):
         pass  # do nothing
     def init_cache_one_gpu_batch(self, cache_home):
         pass  # do nothing
@@ -96,12 +102,14 @@ class BaseModel:
                  config:FlexModelConfig, 
                  env:ExecutionEnv, 
                  policy:Policy, 
-                 weight_map:dict):
+                 weight_map:dict, 
+                 path:str):
         self.config = config
         self.env = env
         self.policy = policy
         self.num_gpu_batches = policy.num_gpu_batches
         self.weight_map = weight_map
+        self.path = path
         self.layers:List[Union[BaseModelLayer, BaseTransformerLayer]] = []
         self.task = None
 
@@ -130,46 +138,240 @@ class BaseModel:
     def num_layers(self, ):
         return len(self.layers)
     
-    def init_cache_area(self, num_layers, num_gpu_batches):
+    def init_cache_area(self, ):
         # cache[j][k]
-        self.cache_home = array_2d(num_layers, num_gpu_batches, ValueHolder)
-        self.cache_read_buf = array_2d(num_layers, num_gpu_batches, ValueHolder)
-        self.cache_write_buf = array_2d(num_layers, num_gpu_batches, ValueHolder)
+        self.cache_home = array_2d(self.num_layers, self.num_gpu_batches, ValueHolder)
+        self.cache_read_buf = array_2d(self.num_layers, self.num_gpu_batches, ValueHolder)
+        self.cache_write_buf = array_2d(self.num_layers, self.num_gpu_batches, ValueHolder)
         # weight[j]
-        self.weight_read_buf = array_1d(num_layers, ValueHolder)
+        self.weight_read_buf = array_1d(self.num_layers, ValueHolder)
         # attention_mask[k]
-        self.attention_mask = array_1d(num_gpu_batches, ValueHolder)
+        self.attention_mask = array_1d(self.num_gpu_batches, ValueHolder)
 
 
-    def load_weight(self, i, j, k, overlap=True):
-        raise NotImplementedError("Func load_weight must be implemented by subclasses")
+    def get_hidden_area(self, cls, i):
+        return cls(*i, ValueHolder)
     
+    def load_weight(self,  
+                    i:List[Union[int, float]], 
+                    j:List[Union[int, float]], 
+                    k:List[Union[int, float]], 
+                    overlap:bool =True):
+        # Handle corner cases
+        if j == self.num_layers:
+            j = 0
+            i += 1
+            if i == self.execute_gen_len:
+                return
+
+        # Load from weight_home to weight_read_buf
+        if overlap:
+            with torch.cuda.stream(self.load_weight_stream):
+                self.layers[j].load_weight(self.weight_home[j], self.weight_read_buf[j], k)
+        else:
+            self.layers[j].load_weight(self.weight_home[j], self.weight_read_buf[j], k)
+
     def delete_weight(self, j, k):
-        raise NotImplementedError("Func delete_weight must be implemented by subclasses")
+        if k == 0:
+            for x in self.weight_home[j].pop():
+                if isinstance(x, ValueHolder):
+                    for y in x.pop():
+                        y.delete()
+                else:
+                    x.delete()
+    
+    def init_cache(self, 
+                   j:List[Union[int, float]], 
+                   k:List[Union[int, float]]):
+        self.layers[j].init_cache_one_gpu_batch(self.cache_home[j][k])
 
-    def init_cache(self, j, k):
-        raise NotImplementedError("Func init_cache must be implemented by subclasses")
+    def load_cache(self,  
+                   i:List[Union[int, float]], 
+                   j:List[Union[int, float]], 
+                   k:List[Union[int, float]], 
+                   overlap:bool =True):
+        # Handle corner cases
+        if i == 0:  # prefill, no cache
+            return
+        if k == self.num_gpu_batches:
+            k = 0
+            j += 1
+        if j == self.num_layers:
+            j = 0
+            i += 1
+            if i == self.execute_gen_len:
+                return
 
-    def load_cache(self, i, j, k, overlap=True):
-        raise NotImplementedError("Func load_cache must be implemented by subclasses")
+        # Load from cache_home to cache_read_buf
+        if overlap:
+            with torch.cuda.stream(self.load_cache_stream):
+                self.layers[j].load_cache(self.cache_home[j][k], self.cache_read_buf[j][k], i)
+        else:
+            self.layers[j].load_cache(self.cache_home[j][k], self.cache_read_buf[j][k], i)
 
-    def store_cache(self, i, j, k, overlap=True):
-        raise NotImplementedError("Func store_cache must be implemented by subclasses")
+    def store_cache(self,  
+                    i:List[Union[int, float]], 
+                    j:List[Union[int, float]], 
+                    k:List[Union[int, float]], 
+                    overlap:bool=True):
+        # Handle corner cases
+        if k == -1:
+            k = self.num_gpu_batches - 1
+            j -= 1
+        if j == -1:
+            j = self.num_layers - 1
+            i -= 1
+            if i == -1:
+                return
+        if i == self.task.gen_len - 1:  # last token, no need to store cache
+            self.cache_write_buf[j][k].pop()
+            return
+
+        # Store cache_write_buf to cache_home
+        # Delete cache_write_buf
+        if overlap:
+            with torch.cuda.stream(self.store_cache_stream):
+                self.layers[j].store_cache(self.cache_home[j][k], self.cache_write_buf[j][k], i)
+        else:
+            self.layers[j].store_cache(self.cache_home[j][k], self.cache_write_buf[j][k], i)
 
     def delete_cache(self, j, k):
-       raise NotImplementedError("Func delete_cache must be implemented by subclasses")
+        v = self.cache_home[j][k].pop()
+        if v:
+            for x in v:
+                x.delete()
 
+    def load_hidden(self, 
+                   i:List[Union[int, float]], 
+                   j:List[Union[int, float]], 
+                   k:List[Union[int, float]], ):
+        # Handle corner cases
+        if k == self.num_gpu_batches:
+            k = 0
+            j += 1
+        if j == self.num_layers:
+            j = 0
+            i += 1
+            if i == self.execute_gen_len:
+                return
 
-    def load_hidden(self, i, j, k):
-        raise NotImplementedError("Func load_hidden must be implemented by subclasses")
-
+        # Load to hidden states buffers
+        dst = self.layers[j].compute_device
+        if j == 0:
+            gpu_batch_size = self.policy.gpu_batch_size
+            left, right = k * gpu_batch_size, (k + 1) * gpu_batch_size
+            if i == 0:  # load from the input ids
+                val = dst.allocate((gpu_batch_size, self.task.prompt_len), np.int32)
+                val.load_from_np(self.output_ids[left:right, :self.task.prompt_len])
+            else:  # load from the last generated token
+                pos = self.task.prompt_len + i
+                val = dst.allocate((gpu_batch_size, 1), np.int32)
+                val.load_from_np(self.output_ids[left:right, pos-1:pos])
+        else:  # load from the last layer
+            val = self.hidden[i][j-1][k].pop().move(dst)
+        self.hidden[i][j][k].store(val)
 
     def store_hidden(self, i, j, k):
-        raise NotImplementedError("Func store_hidden must be implemented by subclasses")
+        # Handle corner cases
+        if k == -1:
+            k = self.num_gpu_batches - 1
+            j -= 1
+        if j == -1:
+            j = self.num_layers - 1
+            i -= 1
+            if i == -1:
+                return
 
-
+        # Store to hidden states buffers
+        if j == self.num_layers - 1:  # store to output
+            gpu_batch_size = self.policy.gpu_batch_size
+            left, right = k * gpu_batch_size, (k + 1) * gpu_batch_size
+            # ids = self.hidden[i][j][k].pop().data.detach().cpu().numpy()
+            if self.task.logits:
+                ids, logits = self.hidden[i][j][k].pop()
+                logits = logits.data.detach().cpu().numpy()
+                ids = ids.data.detach().cpu().numpy()
+            else:
+                ids = self.hidden[i][j][k].pop().data.detach().cpu().numpy()
+                logits = None
+            pos = self.task.prompt_len + i
+            if self.task.stop:
+                stopped = self.stopped[left:right]
+                self.output_ids[left:right, pos:pos+1] = np.where(
+                    stopped, self.config.pad_token_id, ids)
+                stopped[:] = np.logical_or(stopped, ids == self.task.stop)
+            else:
+                self.output_ids[left:right, pos:pos+1] = ids
+        else:  # move to home
+            x = self.hidden[i][j][k]
+            if x.val:  # x may already be moved due to overlapping
+                x.val = x.val.move(self.act_home)
+    
     def compute_layer(self, i, j, k):
-        raise NotImplementedError("Func compute_layer must be implemented by subclasses")
+        # Update the hidden in place
+        # Clear the weight_read_buf if it is the last gpu batch
+        # Clear the cache_read_buf
+        # Run layer computation
+        self.layers[j].forward(self.hidden[i][j][k], self.cache_read_buf[j][k],
+            self.weight_read_buf[j], self.attention_mask[k],
+            self.cache_write_buf[j][k], i, k)
+    
+    def sync(self):
+        self.env.disk.synchronize()
+        torch.cuda.synchronize()
+
+    def delete_all_weights(self):
+        for j in range(self.num_layers):
+            self.delete_weight(j, 0)
+
+    def update_attention_mask(self, i, k):
+        if i > 0:
+            mask = self.attention_mask[k]
+            assert mask.val is not None
+            mask.val = mask.val.device.extend_attention_mask(mask.val, [True])
+            return
+
+        gpu_batch_size = self.policy.gpu_batch_size
+        left = k * gpu_batch_size
+        right = left + gpu_batch_size
+        input_ids = self.output_ids[left:right, :self.task.prompt_len]
+
+        attention_compute = (self.env.cpu if self.policy.cpu_cache_compute
+            else self.env.gpu)
+        val = attention_compute.allocate(
+            (self.policy.gpu_batch_size, self.task.prompt_len), bool)
+        val.load_from_np((input_ids != self.config.pad_token_id))
+        self.attention_mask[k].store(val)
+    
+    # def load_weight(self, i, j, k, overlap=True):
+    #     raise NotImplementedError("Func load_weight must be implemented by subclasses")
+    
+    # def delete_weight(self, j, k):
+    #     raise NotImplementedError("Func delete_weight must be implemented by subclasses")
+
+    # def init_cache(self, j, k):
+    #     raise NotImplementedError("Func init_cache must be implemented by subclasses")
+
+    # def load_cache(self, i, j, k, overlap=True):
+    #     raise NotImplementedError("Func load_cache must be implemented by subclasses")
+
+    # def store_cache(self, i, j, k, overlap=True):
+    #     raise NotImplementedError("Func store_cache must be implemented by subclasses")
+
+    # def delete_cache(self, j, k):
+    #    raise NotImplementedError("Func delete_cache must be implemented by subclasses")
+
+
+    # def load_hidden(self, i, j, k):
+    #     raise NotImplementedError("Func load_hidden must be implemented by subclasses")
+
+
+    # def store_hidden(self, i, j, k):
+    #     raise NotImplementedError("Func store_hidden must be implemented by subclasses")
+
+
+    # def compute_layer(self, i, j, k):
+    #     raise NotImplementedError("Func compute_layer must be implemented by subclasses")
 
     def generation_loop_normal(self):
         for i in range(self.execute_gen_len):
@@ -406,7 +608,191 @@ class BaseModel:
                 timers("generate").costs.append(timers("prefill").costs[0])
             else:
                 timers("generate").costs.append(self.num_layers * batch_cost)
+    
+    def __del__(self):
+        self.delete_all_weights()
 
+    def get_logits(self, inputs: Union[np.array, List[List[int]]]):
+        
+        max_new_tokens = 1
+        do_sample = False
+        temperature = 1.0
+        stop = None
+        cut_gen_len = 1
+        
+        task = Task(
+            inputs=inputs,
+            prompt_len=len(inputs[0]),
+            gen_len=max_new_tokens,
+            cut_gen_len=cut_gen_len,
+            do_sample=do_sample,
+            temperature=temperature,
+            stop=stop,
+            logits=True
+        )
+        
+        tmp_batch_size = None
+        if self.policy.gpu_batch_size * self.num_gpu_batches != len(task.inputs):
+            tmp_batch_size = self.policy.gpu_batch_size
+            self.policy.gpu_batch_size = len(task.inputs)
+        num_layers = self.num_layers
+        num_batches = self.num_gpu_batches
+        batch_size = self.policy.gpu_batch_size
+        overlap = self.policy.overlap
+        prompt_len, gen_len = task.prompt_len, task.gen_len
+        self.execute_gen_len = task.cut_gen_len if task.cut_gen_len else task.gen_len
+        
+        # Output token ids
+        self.output_ids = np.full((len(task.inputs), prompt_len + gen_len),
+                                  self.config.pad_token_id,
+                                  dtype=np.int32)
+        self.stopped = np.zeros((len(task.inputs), 1), dtype=bool)
+        self.output_ids[:, :prompt_len] = np.asarray(task.inputs)
+        self.logits = np.zeros((len(task.inputs), prompt_len, self.config.vocab_size), dtype=np.float32)
+        # print(f"self.logits shape: {self.logits.shape}, {prompt_len}, {gen_len} \n =========***********");exit()
+        
+        # if len(task.inputs) != batch_size:
+        #     batch_size = len(task.inputs)
+            # self.policy.batch_size = batch_size
+        assert batch_size * num_batches == len(task.inputs), f"batch_size * num_batches != len(task.inputs)! batch_size:{batch_size}, num_batches:{num_batches}, len(task.inputs):{len(task.inputs)}"
+        
+        for j in range(num_layers):
+            for k in range(num_batches):
+                self.cache_home[j][k].clear()
+                self.cache_read_buf[j][k].clear()
+                self.cache_write_buf[j][k].clear()
+                
+        for j in range(num_layers):
+            self.weight_read_buf[j].clear()
+            
+        for k in range(num_batches):
+            self.attention_mask[k].clear()
+            
+        self.hidden = array_3d(gen_len, num_layers, num_batches, ValueHolder)
+        
+        self.set_task(task)
+        
+        for j in range(num_layers):
+            for k in range(num_batches):
+                self.init_cache(j, k)
+        
+        self.env.cpu.init_attention_compute_workspace(self.config, self.task, self.policy)
+        
+        if not overlap:
+            # No overlap, easy to understand, suitable for debugging
+            self.generation_loop_normal()
+        else:
+            # Overlap I/O and compute
+            if num_batches == 1:
+                self.generation_loop_overlap_single_batch()
+            else:
+                self.generation_loop_overlap_multi_batch()
+                # raise NotImplementedError("Only support num_batches=1 for now")
+                # self.generation_loop_overlap_multi_batch()
+        
+        # Delete cache
+        for j in range(num_layers):
+            for k in range(num_batches):
+                self.delete_cache(j, k)
+                
+        self.env.cpu.del_attention_compute_workspace()
+        if tmp_batch_size is not None:
+            self.policy.gpu_batch_size = tmp_batch_size
+
+        return self.output_ids, self.logits
+    
+    def generate(self,
+                 inputs: Union[np.array, List[List[int]]],
+                 max_new_tokens: int = 32,
+                 do_sample: bool = False,
+                 temperature: float = 1.0,
+                 stop: Optional[int] = None,
+                 debug_mode: Optional[str] = None,
+                 cut_gen_len: Optional[int] = None,
+                 verbose: int = 0):
+        task = Task(
+            inputs=inputs,
+            prompt_len=len(inputs[0]),
+            gen_len=max_new_tokens,
+            cut_gen_len=cut_gen_len,
+            do_sample=do_sample,
+            temperature=temperature,
+            stop=stop,
+        )
+        tmp_batch_size = None
+        if self.policy.gpu_batch_size * self.num_gpu_batches != len(task.inputs):
+            tmp_batch_size = self.policy.gpu_batch_size
+            self.policy.gpu_batch_size = len(task.inputs)
+        num_layers = self.num_layers
+        num_gpu_batches = self.num_gpu_batches
+        gpu_batch_size = self.policy.gpu_batch_size
+        overlap = self.policy.overlap
+        prompt_len, gen_len = task.prompt_len, task.gen_len
+        self.execute_gen_len = task.cut_gen_len if task.cut_gen_len else task.gen_len
+
+        # Output token ids
+        self.output_ids = np.full((len(task.inputs), prompt_len + gen_len),
+            self.config.pad_token_id, dtype=np.int32)
+        self.stopped = np.zeros((len(task.inputs), 1), dtype=bool)
+        self.output_ids[:, :prompt_len] = np.asarray(task.inputs)
+        assert gpu_batch_size * num_gpu_batches == len(task.inputs)
+
+        # Intermediate tensors
+        # The following buffers store values used
+        # for the i-th token, j-th layer, k-th gpu batch.
+        num_layers, num_gpu_batches = self.num_layers, self.policy.num_gpu_batches
+        for j in range(num_layers):
+            for k in range(num_gpu_batches):
+                self.cache_home[j][k].clear()
+                self.cache_read_buf[j][k].clear()
+                self.cache_write_buf[j][k].clear()
+        for j in range(num_layers):
+            self.weight_read_buf[j].clear()
+        for k in range(num_gpu_batches):
+            self.attention_mask[k].clear()
+        self.hidden = array_3d(gen_len, num_layers, num_gpu_batches, ValueHolder)
+
+        # Init cache
+        self.set_task(task)
+        for j in range(num_layers):
+            for k in range(num_gpu_batches):
+                self.init_cache(j, k)
+        if self.policy.cpu_cache_compute:
+            self.env.cpu.init_attention_compute_workspace(self.config, self.task, self.policy)
+
+        # Generate
+        if debug_mode is None:
+            if not overlap:
+                # No overlap, easy to understand, suitable for debugging
+                self.generation_loop_normal()
+            else:
+                # Overlap I/O and compute
+                if num_gpu_batches == 1:
+                    self.generation_loop_overlap_single_batch()
+                else:
+                    self.generation_loop_overlap_multi_batch()
+        elif debug_mode == "fewer_batch":
+            # Run fewer layeres and batches for debugging
+            if num_gpu_batches == 1:
+                self.generation_loop_debug_single_batch()
+            else:
+                self.generation_loop_debug_multi_batch()
+        elif debug_mode == "breakdown":
+            # No overlap, fewer batches, execution time breakdown
+            self.generation_loop_debug_normal()
+        else:
+            raise ValueError("Invalid debug mode: {debug_mode}")
+
+        # Delete cache
+        for j in range(num_layers):
+            for k in range(num_gpu_batches):
+                self.delete_cache(j, k)
+        if self.policy.cpu_cache_compute:
+            self.env.cpu.del_attention_compute_workspace()
+        if tmp_batch_size is not None:
+            self.policy.gpu_batch_size = tmp_batch_size
+
+        return self.output_ids
     
 
     

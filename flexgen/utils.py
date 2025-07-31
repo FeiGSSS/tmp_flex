@@ -11,50 +11,13 @@ from typing import Tuple, Union, Optional, Any, Sequence, List
 import numpy as np
 import torch
 
+# from flexgen.compression import CompressionConfig
 
 KB = 1 << 10
 MB = 1 << 20
 GB = 1 << 30
 T = 1e12
-
-
-@dataclasses.dataclass(frozen=True)
-class Task:
-    """A generation task."""
-    inputs: Union[np.array, List[List[int]]]
-    prompt_len: int
-    gen_len: int
-    cut_gen_len: Optional[int]
-
-    do_sample: bool
-    temperature: float
-    stop: Optional[int]
-
-    logits: bool = False  # Whether to return logits for each token
-
-
-@dataclasses.dataclass(frozen=True)
-class ExecutionEnv:
-    """Hardware environment."""
-    gpu: Any = None
-    cpu: Any = None
-    disk: Any = None
-    mixed: Any = None
-    numa: Any = None
-
-    # @classmethod
-    # def create(cls, offload_dir):
-    #     # fix recursive import
-    #     from flexgen.pytorch_backend import TorchDevice, TorchDisk, TorchMixedDevice
-    #     gpu = TorchDevice("cuda:0")
-    #     cpu = TorchDevice("cpu")
-    #     disk = TorchDisk(offload_dir)
-    #     numa = TorchDevice("numa")
-    #     return cls(gpu=gpu, cpu=cpu, disk=disk, mixed=TorchMixedDevice([gpu, cpu, disk]), numa=numa)
-
-    def close_copy_threads(self):
-        self.disk.close_copy_threads()
-
+DUMMY_WEIGHT = "_DUMMY_"  # Use dummy weights for benchmark purposes
 
 @dataclasses.dataclass(frozen=True)
 class BenchmarkResult:
@@ -304,3 +267,22 @@ def read_benchmark_log(filename):
         decode_latency, decode_throughput,
         total_latency, total_throughput,
     )
+
+def get_filename(args):
+    model_size = args.model.split('-')[-1]
+    percent = ""
+    for i in range(len(args.percent)):
+        percent += str(args.percent[i]) + "-"
+    filename = f"fo-{model_size}-gbs{args.gpu_batch_size}-" \
+               f"ngbs{args.num_gpu_batches}-" \
+               f"prompt{args.prompt_len}-" \
+               f"gen{args.gen_len}-percent-{percent}"
+    if args.cpu_cache_compute:
+        filename += "cpu-cache"
+    else:
+        filename += "gpu-cache"
+    if args.compress_weight:
+        filename += "-compw"
+    if args.compress_cache:
+        filename += "-compc"
+    return filename

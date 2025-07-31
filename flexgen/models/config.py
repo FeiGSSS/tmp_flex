@@ -5,6 +5,7 @@
 import dataclasses
 import json
 from typing import Dict, Any
+import numpy as np
 
 from huggingface_hub import hf_hub_download
 
@@ -17,11 +18,13 @@ class FlexModelConfig:
     # --- 尺寸参数 ---
     input_dim: int
     hidden_size: int
-    num_attention_heads: int
+    n_head: int
     num_hidden_layers: int
     vocab_size: int
     num_key_value_heads: int  # 用于 GQA/MQA
     rms_norm_eps: float
+    ffn_embed_dim: int
+    dtype: type 
 
     # --- 架构定义 ---
     model_type: str # 'llama', 'opt', 'deepseek', etc.
@@ -37,9 +40,9 @@ class FlexModelConfig:
             # 1. 先检查并设置所有显式定义的核心字段
             required_fields = [field.name for field in dataclasses.fields(self)]
             for field in required_fields:
-                if field not in kwargs:
-                    raise TypeError(f"缺少必填参数: {field}")
-                setattr(self, field, kwargs[field])  # 设置核心字段
+                if field in kwargs:
+                    # raise TypeError(f"缺少必填参数: {field}")
+                    setattr(self, field, kwargs[field])  # 设置核心字段
 
             # 2. 将所有参数（包括核心字段和额外字段）存入实例的__dict__
             # 这样可以通过config.xxx直接访问所有参数
@@ -81,7 +84,7 @@ class FlexModelConfigFactory:
     def from_hf_config(config: dict) -> FlexModelConfig:
         model_type = config.get("model_type")
         explicit_params = {
-                            "model_type", "hidden_size", "num_attention_heads", 
+                            "model_type", "hidden_size", "ffn_dim",  
                             "num_hidden_layers", "vocab_size", "num_key_value_heads",
                             "rms_norm_eps", "mlp_type", "normalization_type",
                             "positional_embedding_type", "layer_name_map", 
@@ -94,8 +97,10 @@ class FlexModelConfigFactory:
                 input_dim=config["hidden_size"],
                 model_type=model_type,
                 hidden_size=config["hidden_size"],
-                num_attention_heads=config["num_attention_heads"],
+                n_head=config["num_attention_heads"],
                 num_hidden_layers=config["num_hidden_layers"],
+                ffn_embed_dim=config["ffn_dim"],
+                dtype=np.float16,
                 
                 vocab_size=config["vocab_size"],
                 num_key_value_heads=config.get("num_key_value_heads", config["num_attention_heads"]),
@@ -124,12 +129,13 @@ class FlexModelConfigFactory:
                 input_dim=config["hidden_size"],
                 model_type=model_type,
                 hidden_size=config["hidden_size"],
-                num_attention_heads=config["num_attention_heads"],
+                n_head=config["num_attention_heads"],
                 num_hidden_layers=config["num_hidden_layers"],
                 vocab_size=config["vocab_size"],
                 num_key_value_heads=config.get("num_key_value_heads", config["num_attention_heads"]),
                 rms_norm_eps=config.get("layer_norm_eps", 1e-5), # OPT uses layer_norm_eps
                 mlp_type='GELU-MLP',
+                dtype=np.float16,
                 normalization_type='LayerNorm',
                 positional_embedding_type='Absolute',
                 layer_name_map={

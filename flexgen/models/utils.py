@@ -1,10 +1,105 @@
 import numpy as np
-import os
+import os, torch, dataclasses
+from typing import Union, Optional, Any, Sequence, List
 
-from flexgen.utils import torch_dtype_to_np_dtype
+from flexgen.utils import torch_dtype_to_np_dtype, DUMMY_WEIGHT, GB
+from flexgen.compression import CompressionConfig
+
+# DUMMY_WEIGHT = "_DUMMY_"  # Use dummy weights for benchmark purposes
 
 
-DUMMY_WEIGHT = "_DUMMY_"  # Use dummy weights for benchmark purposes
+@dataclasses.dataclass
+class Policy:
+    gpu_batch_size: int
+    num_gpu_batches: int
+
+    # percent = a means a%
+    w_gpu_percent: float
+    w_cpu_percent: float
+    w_numa_percent: float
+    cache_gpu_percent: float
+    cache_cpu_percent: float
+    cache_numa_percent: float
+    act_gpu_percent: float
+    act_cpu_percent: float
+    act_numa_percent: float
+
+    # Whether to overlap the I/O and compute
+    overlap: bool
+
+    # Whether to separate attention and mlp as two layers
+    sep_layer: bool
+
+    # Whether to use pinned memory for weights on CPU
+    pin_weight: bool
+
+    # Whether to compute attention on CPU
+    cpu_cache_compute: bool
+
+    # Sparsity of attention weights
+    attn_sparsity: float
+
+    # Compress weights with group-wise quantization
+    compress_weight: bool
+    comp_weight_config: CompressionConfig
+
+    # Compress KV cache with group-wise quantization
+    compress_cache: bool
+    comp_cache_config: CompressionConfig
+
+    @property
+    def w_disk_percent(self):
+        return 100 - self.w_gpu_percent - self.w_cpu_percent - self.w_numa_percent
+
+    @property
+    def cache_disk_percent(self):
+        return 100 - self.cache_gpu_percent - self.cache_cpu_percent - self.cache_numa_percent
+
+    @property
+    def act_disk_percent(self):
+        return 100 - self.act_gpu_percent - self.act_cpu_percent - self.act_numa_percent
+
+
+@dataclasses.dataclass(frozen=True)
+class Task:
+    """A generation task."""
+    inputs: Union[np.array, List[List[int]]]
+    prompt_len: int
+    gen_len: int
+    cut_gen_len: Optional[int]
+
+    do_sample: bool
+    temperature: float
+    stop: Optional[int]
+
+    logits: bool = False  # Whether to return logits for each token
+
+
+@dataclasses.dataclass(frozen=True)
+class ExecutionEnv:
+    """Hardware environment."""
+    gpu: Any = None
+    cpu: Any = None
+    disk: Any = None
+    mixed: Any = None
+    numa: Any = None
+
+    # @classmethod
+    # def create(cls, offload_dir):
+    #     # fix recursive import
+    #     from flexgen.pytorch_backend import TorchDevice, TorchDisk, TorchMixedDevice
+    #     gpu = TorchDevice("cuda:0")
+    #     cpu = TorchDevice("cpu")
+    #     disk = TorchDisk(offload_dir)
+    #     numa = TorchDevice("numa")
+    #     return cls(gpu=gpu, cpu=cpu, disk=disk, mixed=TorchMixedDevice([gpu, cpu, disk]), numa=numa)
+
+    def close_copy_threads(self):
+        self.disk.close_copy_threads()
+
+
+
+
 
 def get_choice(cur_percent, percents, choices):
     percents = np.cumsum(percents)
@@ -26,7 +121,7 @@ def init_weight_list(weight_specs, policy, env):
     for i in range(len(weight_specs)):
         mid_percent = (sizes_cumsum[i] - sizes[i] / 2) / sizes_cumsum[-1]
         home = get_choice(mid_percent * 100, dev_percents, dev_choices)
-        shape, dtype, filename = weight_specs[i]
+        shape, name, filename, dtype = weight_specs[i]
 
         if len(shape) < 2:
             pin_memory = True
@@ -38,7 +133,7 @@ def init_weight_list(weight_specs, policy, env):
         if not compress:
             weight = home.allocate(shape, dtype, pin_memory=pin_memory)
 
-            if DUMMY_WEIGHT not in filename:
+            if DUMMY_WEIGHT not in str(filename):
                 weight.load_from_np_file(weight_specs[i][2])
             else:
                 weight.load_from_np(np.ones(shape, dtype))
@@ -82,7 +177,7 @@ def get_weight_tuple(h, path:str, prefix:str, weight_map:dict):
                 size = (h,)
             else:
                 size = (h, h)
-            tmp.append((size, name, path / value[idx]))
+            tmp.append((size, name, path / value[idx], np.float16))
         return tmp
     for key, value in weight_map.items():
         if isinstance(value, dict):

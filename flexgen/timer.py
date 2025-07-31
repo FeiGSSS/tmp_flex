@@ -61,7 +61,7 @@ class _Timer:
 class Timers:
     """A group of timers."""
 
-    def __init__(self):
+    def __init__(self,):
         self.timers = {}
 
     def __call__(self, name: str):
