@@ -14,7 +14,7 @@ from gguf import GGUFReader
 import shutil
 
 # 导入上面定义的配置系统
-from flexgen.model_config import FlexModelConfigFactory
+from flexgen.models.config import FlexModelConfigFactory
 
 def load_state_dict_and_config(model_path: str):
     """智能加载权重和元数据/配置

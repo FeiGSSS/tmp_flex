@@ -17,7 +17,10 @@ import torch
 from transformers import AutoTokenizer
 
 from flexgen.compression import CompressionConfig
-from flexgen.model_config import OptConfig, get_opt_config, download_model_weights
+# from flexgen.models.config import OptConfig, get_opt_config, download_model_weights
+# from flexgen.models.config import 
+from flexgen.models import get_model_architecture
+from flexgen.models.config import FlexModelConfig
 from flexgen.pytorch_backend import (TorchDevice, TorchDisk, TorchLink, TorchNuma,
     TorchMixedDevice, DeviceType, general_copy, fix_recursive_import)
 from flexgen.timer import timers
@@ -85,63 +88,87 @@ class Policy:
         return 100 - self.act_gpu_percent - self.act_cpu_percent - self.act_numa_percent
 
 
-def get_choice(cur_percent, percents, choices):
-    percents = np.cumsum(percents)
-    assert np.abs(percents[-1] - 100) < 1e-5
+class FlexGenModel:
+    def __init__(self, 
+                 env:ExecutionEnv, 
+                 policy:Policy, 
+                 config:FlexModelConfig, 
+                 weight_map:dict, 
+                 ):
+        self.config = config
+        self.env = env
+        self.policy = policy
+        self.num_gpu_batches = policy.num_gpu_batches
+        self.weight_map = weight_map
+        InputEmbed, TransformerLayer, OutputEmbed = get_model_architecture(self.config.model_type)
+        layers = []
+        layers.append(InputEmbed(self.config, self.env, self.policy, self.weight_map))
+        for layer_id in range(self.config.num_hidden_layers):
+            if self.policy.sep_layer:
+                layers.append(TransformerLayer.attention(self.config, self.env, self.policy, layer_id, self.weight_map['layers'][layer_id]['attention']))
+                layers.append(TransformerLayer.mlp(self.config, self.env, self.policy, layer_id, self.weight_map['layers'][layer_id]['mlp']))
+            else:
+                layers.append(TransformerLayer(self.config, self.env, self.policy, layer_id, self.weight_map['layers']))
+        layers.append(OutputEmbed(self.config, self.env, self.policy, self.weight_map))
 
-    for i in range(len(percents)):
-        if cur_percent < percents[i]:
-            return choices[i]
-    return choices[-1]
+        self.layers = layers
+        self.num_layers = len(layers)
 
-def init_weight_list(weight_specs, policy, env):
-    """
-    根据 weight_specs 初始化权重列表。
-    weight_specs: 一个元组列表 (shape, flexgen_name, full_path_to_npy)
-    """
+        if self.policy.act_gpu_percent == 100:
+            self.act_home = self.env.gpu
+        elif self.policy.act_cpu_percent == 100:
+            self.act_home = self.env.cpu
+        elif self.policy.act_disk_percent == 100:
+            self.act_home = self.env.disk
+        elif self.policy.act_numa_percent == 100:
+            self.act_home = self.env.numa
+        else:
+            raise NotImplementedError()
 
-    dev_percents = [policy.w_disk_percent, policy.w_cpu_percent, policy.w_gpu_percent, policy.w_numa_percent]
-    dev_choices = [env.disk, env.cpu, env.gpu, env.numa]
+        # CUDA streams
+        self.load_weight_stream = torch.cuda.Stream()
+        self.load_cache_stream = torch.cuda.Stream()
+        self.store_cache_stream = torch.cuda.Stream()
 
-    sizes = [np.prod(spec[0]) for spec in weight_specs]
-    sizes_cumsum = np.cumsum(sizes)
-    ret = []
-    
-    for i in range(len(weight_specs)):
-        shape, flexgen_name, file_path = weight_specs[i]
+        # Intermediate tensors
+        # The following buffers store values used
+        # for the i-th token, j-th layer, k-th gpu batch.
+        num_layers, num_gpu_batches = self.num_layers, self.policy.num_gpu_batches
+
+        # cache[j][k]
+        self.cache_home = array_2d(num_layers, num_gpu_batches, ValueHolder)
+        self.cache_read_buf = array_2d(num_layers, num_gpu_batches, ValueHolder)
+        self.cache_write_buf = array_2d(num_layers, num_gpu_batches, ValueHolder)
+        # weight[j]
+        self.weight_read_buf = array_1d(num_layers, ValueHolder)
+        # attention_mask[k]
+        self.attention_mask = array_1d(num_gpu_batches, ValueHolder)
+
+        self.task = None
+
+        self.init_all_weights()
+
+    def set_task(self, task):
+        self.task = task
+        for l in self.layers:
+            l.set_task(task)
+
+    def init_all_weights(self):
+        self.weight_home = array_1d(self.num_layers, ValueHolder)
+        for j in range(self.num_layers):
+            self.init_weight(j)
+
+    def init_weight(self, j):
+        expanded_path = os.path.abspath(os.path.expanduser(
+            os.path.join(self.path, f"{self.config.name}-np")))
+        check_path = os.path.join(expanded_path, "decoder.embed_positions.weight")
+        if not os.path.exists(check_path) and DUMMY_WEIGHT not in check_path:
+            download_model_weights(self.config.name, self.path)
+
+        self.layers[j].init_weight(self.weight_home[j], expanded_path)
         
-        mid_percent = (sizes_cumsum[i] - sizes[i] / 2) / sizes_cumsum[-1]
-        home = get_choice(mid_percent * 100, dev_percents, dev_choices)
 
-        if len(shape) < 2:
-            pin_memory = True
-            compress = False
-        else:
-            pin_memory = policy.pin_weight
-            compress = policy.compress_weight
 
-        if not compress:
-            # 假设 weight.load_from_np_file 存在
-            # weight.dtype 将从加载的 .npy 文件中自动推断
-            weight = home.allocate(shape, np.float16, pin_memory=pin_memory) # 假设默认dtype
-            if DUMMY_WEIGHT not in flexgen_name:
-                weight.load_from_np_file(file_path)
-            else:
-                weight.load_from_np(np.ones(shape, dtype=np.float16))
-        else:
-            # 压缩逻辑保持不变
-            weight = home.compressed_device.allocate(
-                shape, np.float16, policy.comp_weight_config, pin_memory=pin_memory)
-            if DUMMY_WEIGHT not in flexgen_name:
-                weight.load_from_np_file(file_path)
-            else:
-                # ... dummy a compressed weight ...
-                for i in range(2):
-                    x = weight.data[i]
-                    x.load_from_np(np.ones(x.shape, torch_dtype_to_np_dtype[x.dtype]))
-                # pass
-        ret.append(weight)
-    return ret
 
 
 class InputEmbed:

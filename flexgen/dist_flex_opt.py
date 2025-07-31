@@ -16,7 +16,7 @@ from flexgen.flex_model import (Policy, InputEmbed, OutputEmbed, SelfAttention,
                               MLP, TransformerLayer, OptLM, get_filename,
                               add_parser_arguments, get_test_inputs,
                               DUMMY_WEIGHT)
-from flexgen.model_config import get_opt_config
+from flexgen.models.config import get_opt_config
 from flexgen.pytorch_backend import (TorchDevice, TorchDisk, TorchLink,
     TorchMixedDevice, TorchTensor)
 from flexgen.timer import timers
