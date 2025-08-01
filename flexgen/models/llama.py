@@ -18,27 +18,30 @@ from flexgen.pytorch_backend import (TorchDevice, TorchDisk, TorchLink, TorchNum
 # from flex_model import init_weight_list, ValueHolder
 fix_recursive_import()
 
-class OPTModelComputation:
+class LLaMAModelComputation:
     def __init__(self):
         pass
 
 class LLaMAInputEmbed(BaseModelLayer):
-    def init_weight(self, weight_home, converted_path: str):
-        h = self.config.hidden_size
-        v = self.config.vocab_size
-        
-        # LLaMA-like 模型只有词嵌入 (位置编码由 RoPE 在计算中动态生成)
-        weight_specs = [
-            ((v, h), "embed_tokens", Path(converted_path) / "embed_tokens.npy")
-        ]
-        
-        weights = init_weight_list(weight_specs, self.policy, self.env)
-        weight_home.store(weights)
+    def init_weight(self, 
+                    config:FlexModelConfig, 
+                    env:ExecutionEnv, 
+                    policy:Policy, 
+                    weight_map:dict, 
+                    computation: 'LLaMAModelComputation'):
+        super().__init__(config, env, policy, weight_map=weight_map) 
+        self.computation = computation  
 
 class LLaMASelfAttention(BaseModelLayer):
-    def __init__(self, config, env, policy, layer_id: int):
-        super().__init__(config, env, policy)
-        self.layer_id = layer_id
+    def __init__(self, 
+                 config:FlexModelConfig, 
+                 env:ExecutionEnv, 
+                 policy:Policy, 
+                 weight_map:dict, 
+                 computation: 'LLaMAModelComputation'):
+        super().__init__(config, env, policy, weight_map=weight_map) 
+        self.computation = computation
+
 
     def init_weight(self, weight_home, converted_path: str):
         h = self.config.hidden_size
@@ -56,9 +59,14 @@ class LLaMASelfAttention(BaseModelLayer):
         weight_home.store(weights)
 
 class LLaMAMLP(BaseModelLayer):
-    def __init__(self, config, env, policy, layer_id: int):
-        super().__init__(config, env, policy)
-        self.layer_id = layer_id
+    def __init__(self, 
+                 config:FlexModelConfig, 
+                 env:ExecutionEnv, 
+                 policy:Policy, 
+                 weight_map:dict, 
+                 computation: 'LLaMAModelComputation'):
+        super().__init__(config, env, policy, weight_map=weight_map) 
+        self.computation = computation
 
     def init_weight(self, weight_home, converted_path: str):
         h = self.config.hidden_size
@@ -75,7 +83,13 @@ class LLaMAMLP(BaseModelLayer):
         weight_home.store(weights)
 
 class LLaMATransformerLayer(BaseTransformerLayer):
-    def __init__(self, config, env, policy, layer_id: int):
-        super().__init__(config, env, policy, layer_id)
-        self.attention = LLaMASelfAttention(config, env, policy, layer_id)
-        self.mlp = LLaMAMLP(config, env, policy, layer_id)
+    def __init__(self, 
+                 config:FlexModelConfig, 
+                 env:ExecutionEnv, 
+                 policy:Policy, 
+                 layer_id: int, 
+                 weight_map: dict, 
+                 computation: 'LLaMAModelComputation'):
+        layer_map = weight_map[layer_id]
+        self.attention = LLaMASelfAttention(config, env, policy, layer_id, layer_map['attention'], computation=computation)
+        self.mlp = LLaMAMLP(config, env, policy, layer_id, layer_map['attention'], computation=computation)

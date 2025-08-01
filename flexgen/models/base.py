@@ -73,10 +73,8 @@ class BaseTransformerLayer(BaseModelLayer):
                  config:FlexModelConfig, 
                  env:ExecutionEnv, 
                  policy:Policy, 
-                 layer_id: int, 
                  weight_map: dict):
         super().__init__(config, env, policy, weight_map=weight_map)
-        self.layer_id = layer_id
         # 子类将负责实例化具体的 attention 和 mlp 层
         self.attention = None
         self.mlp = None

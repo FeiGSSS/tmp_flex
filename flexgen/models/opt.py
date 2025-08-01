@@ -767,11 +767,15 @@ class OPTMLP(BaseModelLayer):
 
 
 class OPTTransformerLayer(BaseTransformerLayer):
-    def __init__(self, config, env, policy, layer_id: int, weight_map: dict, computation: 'OPTModelComputation'):
-        layer_map = weight_map[layer_id]
-        super().__init__(config, env, policy, layer_id, layer_map)
-        self.attention = OPTSelfAttention(config, env, policy, layer_id, layer_map['attention'], computation=computation)
-        self.mlp = OPTMLP(config, env, policy, layer_id, layer_map['mlp'], computation=computation)
+    def __init__(self, 
+                 config:FlexModelConfig, 
+                 env:ExecutionEnv, 
+                 policy:Policy, 
+                 weight_map: dict, 
+                 computation: 'OPTModelComputation'):
+        super().__init__(config, env, policy, weight_map)
+        self.attention = OPTSelfAttention(config=config, env=env, policy=policy, weight_map=weight_map['attention'], computation=computation)
+        self.mlp = OPTMLP(config=config, env=env, policy=policy, weight_map=weight_map['mlp'], computation=computation)
 
     def init_weight(self, 
                     weight_home, 
@@ -849,7 +853,7 @@ class OptModel(BaseModel):
                 self.layers.append(OPTSelfAttention(self.config, self.env, self.policy, self.weight_map['layers'][layer_id]['attention'], self.computation))
                 self.layers.append(OPTMLP(self.config, self.env, self.policy, self.weight_map['layers'][layer_id]['mlp'], self.computation))
             else:
-                self.layers.append(OPTTransformerLayer(self.config, self.env, self.policy, layer_id, self.weight_map['layers'], self.computation))
+                self.layers.append(OPTTransformerLayer(self.config, self.env, self.policy, self.weight_map['layers'][layer_id], self.computation))
         self.layers.append(OPTOutputEmbed(self.config, self.env, self.policy, self.weight_map, self.computation))
 
 
