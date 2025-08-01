@@ -23,7 +23,7 @@ class OPTModelComputation:
     """
     此类封装了所有原先在 pytorch_backend.py 中为 OPT 模型定义的计算逻辑。
     """
-    def opt_input_embed(self, compute_device, inputs, attention_mask, w_token, w_pos, pad_token_id, donate):
+    def input_embed(self, compute_device, inputs, attention_mask, w_token, w_pos, pad_token_id, donate):
         # decompress weights
         if w_token.device.device_type == DeviceType.COMPRESSED:
             w_token = w_token.device.decompress(w_token)
@@ -49,7 +49,7 @@ class OPTModelComputation:
         data = token_embed + pos_embed
         return TorchTensor.create_from_torch(data, compute_device)
 
-    def opt_output_embed(self, compute_device, inputs, w_ln, b_ln, w_token, donate,
+    def output_embed(self, compute_device, inputs, w_ln, b_ln, w_token, donate,
                          do_sample, temperature):
         # decompress weights
         if w_token.device.device_type == DeviceType.COMPRESSED:
@@ -418,7 +418,7 @@ class OPTInputEmbed(BaseModelLayer):
         else:
             (w_token, _), (w_pos, _) = weight_read_buf.val
 
-        h = self.computation.opt_input_embed(self.compute_device, h, mask,
+        h = self.computation.input_embed(self.compute_device, h, mask,
             w_token, w_pos, self.config.pad_token_id, donate)
         hidden.val = h
 
@@ -482,7 +482,7 @@ class OPTOutputEmbed(BaseModelLayer):
         else:
             (w_ln, _), (b_ln, _), (w_token, _) = weight_read_buf.val
 
-        h, logits = self.computation.opt_output_embed(self.compute_device, h, w_ln, b_ln, w_token, donate,
+        h, logits = self.computation.output_embed(self.compute_device, h, w_ln, b_ln, w_token, donate,
             self.task.do_sample, self.task.temperature)
         if self.task.logits:
             hidden.val = [h, logits]
@@ -877,7 +877,6 @@ class OptModel(BaseModel):
     
 
     def init_all_weights(self, flexgen_weight_path):
-        self.weight_home = array_1d(self.num_layers, ValueHolder)
         for layer_id, layer in enumerate(self.layers):
             layer.init_weight(self.weight_home[layer_id], flexgen_weight_path)
 

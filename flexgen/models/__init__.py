@@ -23,7 +23,7 @@ def get_model_architecture(config:FlexModelConfig,
         A class of ModelArchitecture
     """
     model_type = config.model_type
-    if model_type == "opt":
+    if model_type in ["opt"]:
         return opt.OptModel(
             config=config,
             path=path,
@@ -31,7 +31,17 @@ def get_model_architecture(config:FlexModelConfig,
             env=env,
             weight_map=weight_map
         ) 
-    elif model_type in ["llama", "deepseek", "qwen2", "mistral"]:   
-        return llama 
+    elif model_type in ["llama", "mistral"]:   
+        return llama.LlamaModel(
+            config=config,
+            path=path,
+            policy=policy,
+            env=env,
+            weight_map=weight_map
+        )
+    elif model_type in ["qwen2"]:
+        raise NotImplementedError(f"Model architecture for type '{model_type}' is registering, Please hold on.")
+    elif model_type in ["deepseek_V3"]:
+        raise NotImplementedError(f"Model architecture for type '{model_type}' is registering, Please hold on.")
     else:
         raise NotImplementedError(f"Model architecture for type '{model_type}' is not registered.")

@@ -137,6 +137,7 @@ class BaseModel:
         return len(self.layers)
     
     def init_cache_area(self, ):
+        self.weight_home = array_1d(self.num_layers, ValueHolder)
         # cache[j][k]
         self.cache_home = array_2d(self.num_layers, self.num_gpu_batches, ValueHolder)
         self.cache_read_buf = array_2d(self.num_layers, self.num_gpu_batches, ValueHolder)

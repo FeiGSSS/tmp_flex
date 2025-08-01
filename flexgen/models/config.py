@@ -99,7 +99,7 @@ class FlexModelConfigFactory:
                 hidden_size=config["hidden_size"],
                 n_head=config["num_attention_heads"],
                 num_hidden_layers=config["num_hidden_layers"],
-                ffn_embed_dim=config["ffn_dim"],
+                ffn_embed_dim=config["intermediate_size"],
                 dtype=np.float16,
                 
                 vocab_size=config["vocab_size"],
