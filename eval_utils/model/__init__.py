@@ -1,5 +1,6 @@
 from . import (
     flexgen, 
+    flexgen_model, 
     huggingface, 
 )
 

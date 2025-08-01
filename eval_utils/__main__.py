@@ -2,6 +2,7 @@ import argparse
 import os, sys
 import logging
 from pathlib import Path
+import torch
 import json
 from typing import Union, Optional
 from functools import partial
@@ -286,7 +287,7 @@ def get_model(
         eval_logger.info(
             f"Initializing {args.model_type} model, with arguments: {simple_parse_args_string(model_args)}"
         )
-        if args.model_type in ["flexllmgen", "flexllmgen_gpu", "flexllmgen-gpu", "flexllmgen_cxl", "flexllmgen-cxl"]:
+        if args.model_type in ["flexllmgen", "flexllmgen_gpu", "flexllmgen-gpu", "flexllmgen_cxl", "flexllmgen-cxl", "flexgen_model", "flexgen_model-cxl", "flexgen_model_cxl", "flexgen_model-gpu", "flexgen_model_gpu"]:
             lm = eval_utils.api.registry.get_model(args.model_type).create_from_arg_string(
             model_args,
             {"args": args}
@@ -343,6 +344,7 @@ def get_model(
 
 if __name__ == '__main__':
 
+    torch.set_num_threads(20)
     parser = add_evalaute_parser_arguments()
     args = parser.parse_args()
     print(args)
@@ -474,9 +476,12 @@ if __name__ == '__main__':
         **request_caching_args,
     )
     # exit()
-    results = evaluator.process_all_outputs()
-    results = evaluator.postprocess_results(results)
-    
+    try:
+        results = evaluator.process_all_outputs()
+        results = evaluator.postprocess_results(results)
+    finally:
+        if args.model_type in ["flexgen_model", "flexgen_model-cxl", "flexgen_model_cxl", "flexgen_model-gpu", "flexgen_model_gpu"]:
+            model.close_copy_threads()
 
     # 有结果的话就输出结果
     if results is not None:

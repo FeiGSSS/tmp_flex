@@ -368,7 +368,10 @@ class Evaluate(Simple_Evaluate):
     def process_all_outputs(self, ):
         # process all outputs after getting all outputs, before postprocessing results.
         # resps, cloned_reqs = self.get_all_outputs()
+        # try:
         self.get_all_outputs()
+        # finally:
+            
         for task_output, limit in zip(self.eval_tasks, self.limits):
             task = task_output.task
             task.apply_filters()

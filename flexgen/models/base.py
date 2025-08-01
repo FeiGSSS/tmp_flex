@@ -172,13 +172,19 @@ class BaseModel:
             self.layers[j].load_weight(self.weight_home[j], self.weight_read_buf[j], k)
 
     def delete_weight(self, j, k):
-        if k == 0:
-            for x in self.weight_home[j].pop():
-                if isinstance(x, ValueHolder):
-                    for y in x.pop():
-                        y.delete()
-                else:
-                    x.delete()
+        try:
+            if k == 0:
+                for x in self.weight_home[j].pop():
+                    if isinstance(x, ValueHolder):
+                        for y in x.pop():
+                            y.delete()
+                    else:
+                        x.delete()
+        except TypeError:
+        # 这个 TypeError 只会在解释器关闭、模块已被卸载时发生。
+        # 此时程序即将退出，内存将由操作系统回收，
+        # 所以我们可以安全地忽略这个错误，以避免程序崩溃。
+            pass
     
     def init_cache(self, 
                    j:List[Union[int, float]], 

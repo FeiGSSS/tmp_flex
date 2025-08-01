@@ -1,7 +1,26 @@
 from pathlib import Path
-from flexgen.models.base import BaseModelLayer, BaseTransformerLayer
-from flexgen.models.utils import init_weight_list
+import numpy as np
+import torch
+import torch.nn.functional as F
+from typing import Any, Union, List
+
+from flexgen.models.base import BaseModelLayer, BaseTransformerLayer, BaseModel
+from flexgen.utils import (ValueHolder, 
+                           array_1d, array_2d, array_3d, array_4d)
+from flexgen.models.utils import (ExecutionEnv, Task, Policy, 
+                                  init_weight_list, get_weight_tuple
+                           )
+from flexgen.models.config import FlexModelConfig
+# from flexgen.flex_model import Policy
+from flexgen.pytorch_backend import (TorchDevice, TorchDisk, TorchLink, TorchNuma, TorchTensor, 
+    TorchMixedDevice, DeviceType, general_copy, fix_recursive_import)
+
 # from flex_model import init_weight_list, ValueHolder
+fix_recursive_import()
+
+class OPTModelComputation:
+    def __init__(self):
+        pass
 
 class LLaMAInputEmbed(BaseModelLayer):
     def init_weight(self, weight_home, converted_path: str):
