@@ -90,6 +90,7 @@ class FlexModelConfigFactory:
                             "positional_embedding_type", "layer_name_map", 
                         }
         filtered_config = {k: v for k, v in config.items() if k not in explicit_params}
+        filtered_config['pad_token_id'] = 0
 
         # LLaMA, DeepSeek, Qwen2 等现代模型架构高度相似
         if model_type in ["llama", "deepseek", "qwen2", "mistral"]:

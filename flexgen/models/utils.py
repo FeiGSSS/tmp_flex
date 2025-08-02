@@ -1,6 +1,9 @@
 import numpy as np
-import os, torch, dataclasses
+import os, torch, dataclasses, json
+from pathlib import Path
 from typing import Union, Optional, Any, Sequence, List
+from transformers import AutoTokenizer, PreTrainedTokenizer, PreTrainedTokenizerFast
+
 
 from flexgen.utils import torch_dtype_to_np_dtype, DUMMY_WEIGHT, GB
 from flexgen.compression import CompressionConfig
@@ -100,6 +103,88 @@ class ExecutionEnv:
 
 
 
+# 定义一个常见的仅解码器模型架构列表，用于判断
+# 这个列表可以根据需要进行扩充
+DECODER_ONLY_ARCHITECTURES = [
+    "LlamaForCausalLM",
+    "GPT2LMHeadModel",
+    "GPTJForCausalLM",
+    "GPTNeoXForCausalLM",
+    "OPTForCausalLM",
+    "BloomForCausalLM",
+    "MistralForCausalLM",
+    "MixtralForCausalLM",
+    "Qwen2ForCausalLM",
+    "GemmaForCausalLM",
+]
+
+def get_tokenizer(
+    model_path: str,
+    use_fast_tokenizer: bool = True,
+):
+    gguf_files = None
+    tokenizer_path_or_file = None
+    kwargs = {}
+    path = Path(model_path)
+
+    if path.is_file() and path.suffix == ".gguf":
+        gguf_files = [path]
+    else:
+        gguf_files = list(path.glob("*.gguf"))
+        
+    if gguf_files:
+        kwargs['gguf_file'] = gguf_files[0]
+        # return AutoTokenizer.from_pretrained(model_path, **kwargs)
+    
+    kwargs["use_fast"] = use_fast_tokenizer
+    config_path = None
+    if gguf_files:
+        if len(gguf_files) > 1:
+            print(f"发现多个 .gguf 文件 默认加载第一个 .gguf 文件: {gguf_files[0]}")
+        tokenizer_path_or_file = gguf_files[0]
+    else:
+        tokenizer_path_or_file = path
+
+    # --- 加载分词器和配置 ---
+    if not gguf_files:
+        config_path = tokenizer_path_or_file / "config.json"
+        if not os.path.isfile(config_path):
+            raise ValueError(f"请检查路径 未找到任何 .gguf 文件或 config.json 文件")
+
+        with open(config_path, 'r', encoding='utf-8') as f:
+            config = json.load(f)
+    
+        architectures = config.get("architectures", [])
+        is_decoder_only = any(arch in DECODER_ONLY_ARCHITECTURES for arch in architectures)
+
+    if is_decoder_only or gguf_files:
+        if is_decoder_only:
+             print(f"检测到仅解码器架构: {architectures[0]}。")
+        else: # GGUF
+             print("检测到 GGUF 模型，假定为仅解码器架构。")
+        print("设置 padding_side='left'。")
+        kwargs['padding_side'] = 'left'
+    else:
+        print(f"检测到非仅解码器或未知架构: {architectures}。使用默认填充设置。")
+
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_path_or_file, **kwargs)
+
+    # --- 设置 Pad Token ---
+    if getattr(tokenizer, 'padding_side', 'right') == 'left':
+        if tokenizer.pad_token is None:
+            if tokenizer.eos_token is not None:
+                print("分词器的 pad_token 未设置。使用 eos_token 作为 pad_token。")
+                tokenizer.pad_token = tokenizer.eos_token
+            else:
+                print("警告: 无法自动设置 pad_token，因为 eos_token 也不存在。")
+    
+    print("\n分词器加载成功！")
+    print(f" - 分词器类: {tokenizer.__class__.__name__}")
+    print(f" - 词汇表大小: {tokenizer.vocab_size}")
+    print(f" - Padding Side: {tokenizer.padding_side}")
+    print(f" - Pad Token: '{tokenizer.pad_token}' (ID: {tokenizer.pad_token_id})")
+    
+    return tokenizer
 
 def get_choice(cur_percent, percents, choices):
     percents = np.cumsum(percents)

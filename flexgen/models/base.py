@@ -104,6 +104,7 @@ class BaseModel:
                  path:str):
         self.config = config
         self.env = env
+        self.compute_device = self.env.gpu
         self.policy = policy
         self.num_gpu_batches = policy.num_gpu_batches
         self.weight_map = weight_map

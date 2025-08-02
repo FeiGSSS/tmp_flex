@@ -32,7 +32,8 @@ from flexgen.pytorch_backend import (
     TorchMixedDevice, 
     fix_recursive_import
 )
-from flexgen.models.utils import (ExecutionEnv, Policy)
+from flexgen.models.utils import (ExecutionEnv, Policy, 
+                                  get_tokenizer)
 from flexgen.models.config import FlexModelConfig
 from flexgen.models.load_convert.load_weight import AutoFlexModel
 from flexgen.models import get_model_architecture
@@ -210,12 +211,13 @@ class flexgen_model(TemplateLM):
         self.flag = 0 # clear self.latancy_dict and self.throughput_dict if self.flag == 0
 
         # load tokenizer so we know tokenizer vocabulary size before loading model and PEFT
-        try:
-            self.tokenizer = AutoTokenizer.from_pretrained(args.path, padding_side="left")
-        except:
-            self.tokenizer = AutoTokenizer.from_pretrained(args.model, padding_side="left")
+        # try:
+        #     self.tokenizer = AutoTokenizer.from_pretrained(args.path, padding_side="left")
+        # except:
+        #     self.tokenizer = AutoTokenizer.from_pretrained(args.model, padding_side="left")
             
-
+        self.tokenizer = get_tokenizer(args.path)
+        
         # access self._model through self.model property outside this method
         if isinstance(self.model, torch.nn.Module):
             self.model.eval()

@@ -3,7 +3,8 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import nn
-from typing import Any, Union, List
+from typing import Any, Union, List, Tuple
+from transformers.activations import ACT2FN
 
 from flexgen.models.base import BaseModelLayer, BaseTransformerLayer, BaseModel
 from flexgen.utils import (ValueHolder, 
@@ -20,317 +21,190 @@ from flexgen.pytorch_backend import (TorchDevice, TorchDisk, TorchLink, TorchNum
 fix_recursive_import()
 
 class LLaMAModelComputation:
-    def input_embed(self, compute_device, inputs, attention_mask, w_token, w_pos, pad_token_id, donate):
-        # decompress weights
+    """
+    此类封装了所有为 Llama 模型定义的计算逻辑。
+    代码逻辑主要从 pytorch_backend_llama.py 迁移而来。
+    """
+    def rms_norm(self, x: torch.Tensor, weight: torch.Tensor, variance_epsilon: float = 1e-6):
+        input_dtype = x.dtype
+        x = x.to(torch.float32)
+        variance = x.pow(2).mean(-1, keepdim=True)
+        x = x * torch.rsqrt(variance + variance_epsilon)
+        return (weight * x).to(input_dtype)
+
+    def precompute_freqs_cis(self, dim: int, end: int, inv_freq: torch.Tensor, theta: float = 10000.0):
+        freqs = inv_freq
+        t = torch.arange(end, device=freqs.device)
+        freqs = torch.outer(t, freqs).float()
+        freqs_cis = torch.polar(torch.ones_like(freqs), freqs)
+        return freqs_cis
+
+    def reshape_for_broadcast(self, freqs_cis: torch.Tensor, x: torch.Tensor):
+        ndim = x.ndim
+        assert 0 <= 1 < ndim
+        assert freqs_cis.shape == (x.shape[1], x.shape[-1])
+        shape = [d if i == 1 or i == ndim - 1 else 1 for i, d in enumerate(x.shape)]
+        return freqs_cis.view(*shape)
+
+    def apply_rotary_emb(self, xq: torch.Tensor, xk: torch.Tensor, freqs_cis: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
+        xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
+        freqs_cis = self.reshape_for_broadcast(freqs_cis, xq_)
+        xq_out = torch.view_as_real(xq_ * freqs_cis).flatten(3)
+        xk_out = torch.view_as_real(xk_ * freqs_cis).flatten(3)
+        return xq_out.type_as(xq), xk_out.type_as(xk)
+
+    def input_embed(self, compute_device: TorchDevice, inputs: TorchTensor, w_token: TorchTensor, pad_token_id: int, donate: list):
         if w_token.device.device_type == DeviceType.COMPRESSED:
             w_token = w_token.device.decompress(w_token)
-            w_pos = w_pos.device.decompress(w_pos)
 
         token_ids = inputs.data
-        mask = attention_mask.data
         if donate[0]: inputs.delete()
-        if donate[1]: attention_mask.delete()
-
-        # token embedding
+        
         token_embed = F.embedding(token_ids, w_token.data, pad_token_id)
+        return TorchTensor.create_from_torch(token_embed, compute_device)
 
-        # pos embedding
-        positions = torch.cumsum(mask, dim=1).int() * mask + 1
-
-        # cut positions if `past_key_values_length` is > 0
-        past_key_values_length = mask.shape[1] - token_ids.shape[1]
-        positions = positions[:, past_key_values_length:]
-
-        pos_embed = F.embedding(positions, w_pos.data)
-
-        data = token_embed + pos_embed
-        return TorchTensor.create_from_torch(data, compute_device)
-
-    def output_embed(self, compute_device, inputs, w_ln, b_ln, w_token, donate,
-                         do_sample, temperature):
-        # decompress weights
-        if w_token.device.device_type == DeviceType.COMPRESSED:
-            w_token = w_token.device.decompress(w_token)
-
-        b, s, h = inputs.shape
-
-        hidden = F.layer_norm(inputs.data, (h,), weight=w_ln.data, bias=b_ln.data)
-        if donate[0]: inputs.delete()
-
-        # output embedding
-        logits = F.linear(hidden, w_token.data)
-        last_token_logits = logits[:,-1,:]
-
-        if do_sample and not temperature < 1e-5:
-            probs = torch.softmax(last_token_logits / temperature, dim=-1)
-            ids = torch.multinomial(probs, num_samples=1)
-        else:
-            ids = last_token_logits.argmax(dim=1, keepdim=True)
-        return TorchTensor.create_from_torch(ids, compute_device), TorchTensor.create_from_torch(logits, compute_device)
-
-    def _attention_weights(self, compute_device, q, k, mask, b, src_s, n_head):
-        # shape: (b * n_head, 1, s)
-        attn_weights = torch.bmm(q, k)
-        # shape: (b, 1, 1, s)
-        mask = mask.view(b, 1, 1, src_s)
-        # shape: (b * n_head, 1, s)
-        attn_weights = attn_weights.view(b, n_head, 1, src_s)
-        attn_weights = torch.where(mask, attn_weights, -1e4)
-        attn_weights = attn_weights.view(b * n_head, 1, src_s)
-        attn_weights = F.softmax(attn_weights, dim=2)
-        return attn_weights
-
-    def _attention_value(self, compute_device, q, k, v, mask, b, src_s, tgt_s, n_head, head_dim):
-        # shape: (b * n_head, 1, s)
-        attn_weights = self._attention_weights(compute_device, q, k, mask, b, src_s, n_head)
-        # shape: (b, n_head, 1, head_dim)
-        return torch.bmm(attn_weights, v).view(b, n_head, tgt_s, head_dim)
-
-    def _sparse_attention_value(self, compute_device, q, k, v_new, v_cache, mask, b,
-                                src_s, tgt_s, n_head, head_dim, attn_sparsity):
-        # shape: (b * n_head, 1, s)
-        attn_weights = self._attention_weights(compute_device, q, k, mask, b, src_s, n_head)
-        topk = int(attn_sparsity * (attn_weights.shape[2] - 1))
-        topk_weights, topk_indices = attn_weights[:, :, :-1].topk(
-            topk, dim=2, sorted=False)
-        topk_indices = topk_indices.view(b * n_head, topk).transpose(0, 1)
-        # shape: (b * n_head, 1, topk+1)
-        attn_weights = torch.cat([topk_weights,
-            attn_weights[:, :, -1].unsqueeze(-1)], dim=-1)
-
-        if k.is_cuda:
-            v_home = v_cache
-            v_buf = compute_device.allocate((topk+1, b*n_head, head_dim), np.float16)
-            topk_indices = topk_indices.cpu()
-        else:
-            (v_home, v_buf) = v_cache
-
-        # shape: (s, b * n_head, head_dim)
-        indices_src = topk_indices
-        indices_tgt = (slice(0, indices_src.shape[0]), slice(0, v_home.shape[1]))
-        general_copy(v_buf, indices_tgt, v_home, indices_src)
-        v_home.device.synchronize()
-
-        # shape: (topk+1, b * n_head, head_dim)
-        v = v_buf.data[:topk+1]
-        v[topk:topk+1] = v_new
-        # shape: (b * n_head, topk+1, head_dim)
-        v = v.permute(1, 0, 2).reshape(b * n_head, topk+1, head_dim)
-
-        # shape: (b * n_head, 1, head_dim)
-        return torch.bmm(attn_weights, v).view(b, n_head, tgt_s, head_dim)
-
-    def _mixed_device_attention(self, compute_device, q, k_cache, v_cache, k_new, v_new,
-            mask, b, src_s, tgt_s, n_head, head_dim):
-        # The caches are stored on both gpu and cpu.
-        # Compute attention on gpu for caches stored on gpu.
-        # Compute attention on cpu for caches stored on cpu.
-        k_gpu, k_cpu = k_cache[0].data, k_cache[1].data
-        v_gpu, v_cpu = v_cache[0].data, v_cache[1].data
-        seg = k_gpu.shape[1]
-
-        # Compute GPU part
-        b_gpu = seg // n_head
-        q_gpu = q[:seg]
-        # shape: (s, b * n_head, head_dim)
-        k_gpu = k_gpu[:src_s, :seg, :]
-        v_gpu = v_gpu[:src_s, :seg, :]
-        k_gpu[src_s-1:src_s, :, :] = k_new[:, :seg, :]
-        v_gpu[src_s-1:src_s, :, :] = v_new[:, :seg, :]
-        # shape: (b * n_head, head_dim, s)
-        k_gpu = k_gpu.permute(1, 2, 0)
-        # shape: (b * n_head, s, head_dim)
-        v_gpu = v_gpu.permute(1, 0, 2)
-
-        mask_gpu = mask[:b_gpu].cuda()
-        value_gpu = self._attention_value(compute_device, q_gpu, k_gpu, v_gpu, mask_gpu,
-            b_gpu, src_s, tgt_s, n_head, head_dim)
-
-        # Compute CPU Part
-        b_cpu = b - b_gpu
-        q_cpu = q[seg:].float().cpu()
-        # shape: (s, b * n_head, head_dim)
-        k_cpu = k_cpu[:src_s, seg:, :]
-        v_cpu = v_cpu[:src_s, seg:, :]
-        k_cpu[src_s-1:src_s, :, :] = k_new[:, seg:, :]
-        v_cpu[src_s-1:src_s, :, :] = v_new[:, seg:, :]
-        # shape: (b * n_head, head_dim, s)
-        k_cpu = k_cpu.permute(1, 2, 0)
-        # shape: (b * n_head, s, head_dim)
-        v_cpu = v_cpu.permute(1, 0, 2)
-
-        mask_cpu = mask[b_gpu:]
-        value_cpu = self._attention_value(compute_device, q_cpu, k_cpu, v_cpu, mask_cpu,
-            b_cpu, src_s, tgt_s, n_head, head_dim)
-
-        value = torch.cat([value_gpu, value_cpu.cuda().half()], dim=0)
-        return value
-
-    def mha(self, compute_device, inputs, attention_mask, w_q, b_q, w_k, b_k, w_v, b_v,
-            w_out, b_out, w_ln, b_ln, n_head, donate, compress_cache, comp_config):
-        """Multi-head attention (prefill phase)."""
-        # decompress weights
+    # MODIFICATION: 重写 mha 以支持 GQA
+    # 中文注释: 此函数已重写以正确处理分组查询注意力 (GQA)。
+    # 它会读取 n_kv_head，并根据需要重复 K 和 V 的头，以匹配 Q 的头的数量。
+    def mha(self, compute_device: TorchDevice, hidden_states: TorchTensor, attention_mask: TorchTensor,
+            w_q: TorchTensor, w_k: TorchTensor, w_v: TorchTensor, w_o: TorchTensor, w_norm: TorchTensor,
+            n_head: int, config: FlexModelConfig, donate: list, compress_cache: bool, comp_config: any):
+        
         if w_q.device.device_type == DeviceType.COMPRESSED:
-            w_q = w_q.device.decompress(w_q)
-            w_k = w_k.device.decompress(w_k)
-            w_v = w_v.device.decompress(w_v)
-            w_out = w_out.device.decompress(w_out)
+            w_q, w_k, w_v, w_o = [x.device.decompress(x) for x in [w_q, w_k, w_v, w_o]]
 
-        b, s, h = inputs.shape
-        head_dim = h // n_head
-        scaling = head_dim ** -0.5
+        bsz, q_len, h = hidden_states.shape
+        n_q_head = n_head
+        n_kv_head = getattr(config, 'num_key_value_heads', n_q_head)
+        num_key_value_groups = n_q_head // n_kv_head
+        head_dim = h // n_q_head
+        
+        residual = hidden_states.data
+        hidden_norm = self.rms_norm(hidden_states.data, w_norm.data, config.rms_norm_eps)
+        
+        q = F.linear(hidden_norm, w_q.data)
+        k = F.linear(hidden_norm, w_k.data)
+        v = F.linear(hidden_norm, w_v.data)
 
-        hidden = F.layer_norm(inputs.data, (h,), weight=w_ln.data, bias=b_ln.data)
+        q = q.view(bsz, q_len, n_q_head, head_dim)
+        k = k.view(bsz, q_len, n_kv_head, head_dim)
+        v = v.view(bsz, q_len, n_kv_head, head_dim)
 
-        # shape: (b, s, h)
-        q = F.linear(hidden, w_q.data, bias=b_q.data) * scaling
-        k = F.linear(hidden, w_k.data, bias=b_k.data)
-        v = F.linear(hidden, w_v.data, bias=b_v.data)
-        # shape: (b, s, n_head, head_dim)
-        q = q.view(b, s, n_head, head_dim)
-        k = k.view(b, s, n_head, head_dim)
-        v = v.view(b, s, n_head, head_dim)
+        freqs_cis = compute_device.rotary_emb_cis[:q_len]
+        q, k = self.apply_rotary_emb(q, k, freqs_cis=freqs_cis)
 
-        # shape: (b * n_head, s, head_dim)
-        q = q.permute(0, 2, 1, 3).reshape(b * n_head, s, head_dim)
-        # shape: (b * n_head, head_dim, s)
-        k = k.permute(0, 2, 3, 1).reshape(b * n_head, head_dim, s)
-        # shape: (b * n_head, s, head_dim)
-        v = v.permute(0, 2, 1, 3).reshape(b * n_head, s, head_dim)
+        # K/V to be cached are the original, un-repeated tensors
+        k_to_cache = k.permute(1, 0, 2, 3).reshape(q_len, bsz * n_kv_head, head_dim)
+        v_to_cache = v.permute(1, 0, 2, 3).reshape(q_len, bsz * n_kv_head, head_dim)
 
-        # shape: (b * n_head, s, s)
-        attn_weights = torch.bmm(q, k)
+        q = q.permute(0, 2, 1, 3)
+        k = k.permute(0, 2, 1, 3)
+        v = v.permute(0, 2, 1, 3)
 
-        # shape: (b, 1, s, s)
-        idx = torch.arange(s, device=compute_device.dev)
-        causal_mask = (idx <= idx.view(s, 1)).view(1, 1, s, s)
-        mask = attention_mask.data.view(b, 1, 1, s) & causal_mask
+        if num_key_value_groups > 1:
+            k = k.repeat_interleave(num_key_value_groups, dim=1)
+            v = v.repeat_interleave(num_key_value_groups, dim=1)
 
-        # shape: (b, n_head, s, s)
-        attn_weights = attn_weights.view(b, n_head, s, s)
-        attn_weights = torch.where(mask, attn_weights, -1e4)
-        attn_weights = attn_weights.view(b * n_head, s, s)
-        attn_weights = F.softmax(attn_weights, dim=2)
-        # shape: (b, n_head, s, head_dim)
-        value = torch.bmm(attn_weights, v).view(b, n_head, s, head_dim)
-        # shape: (b, s, h)
-        value = value.transpose(1, 2).reshape(b, s, h)
-        value = F.linear(value, w_out.data, bias=b_out.data)
+        q = q.reshape(bsz * n_q_head, q_len, head_dim)
+        k = k.reshape(bsz * n_q_head, q_len, head_dim)
+        v = v.reshape(bsz * n_q_head, q_len, head_dim)
+        
+        attn_weights = torch.bmm(q, k.transpose(1, 2)) / (head_dim ** 0.5)
+        
+        mask = attention_mask.data.view(bsz, 1, 1, q_len).expand(-1, n_q_head, -1, -1)
+        attn_weights = attn_weights.view(bsz, n_q_head, q_len, q_len)
+        attn_weights = attn_weights + mask
+        attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(v.dtype)
+        
+        value = torch.bmm(attn_weights.view(bsz * n_q_head, q_len, q_len), v)
+        value = value.view(bsz, n_q_head, q_len, head_dim).transpose(1, 2).reshape(bsz, q_len, h)
+        value = F.linear(value, w_o.data)
+        
+        value.add_(residual)
 
-        value.add_(inputs.data)
-
-        if donate[0]: inputs.delete()
+        if donate[0]: hidden_states.delete()
         if donate[1]: attention_mask.delete()
 
-        # (s, b * n_head, head_dim)
-        k = k.permute(2, 0, 1)
-        v = v.permute(1, 0, 2)
-
         if compress_cache:
-            k = compute_device.compressed_device.compress(k, comp_config)
-            v = compute_device.compressed_device.compress(v, comp_config)
+            k_to_cache = compute_device.compressed_device.compress(k_to_cache, comp_config)
+            v_to_cache = compute_device.compressed_device.compress(v_to_cache, comp_config)
         else:
-            k = TorchTensor.create_from_torch(k, compute_device)
-            v = TorchTensor.create_from_torch(v, compute_device)
+            k_to_cache = TorchTensor.create_from_torch(k_to_cache, compute_device)
+            v_to_cache = TorchTensor.create_from_torch(v_to_cache, compute_device)
 
-        return TorchTensor.create_from_torch(value, compute_device), k, v
+        return TorchTensor.create_from_torch(value, compute_device), k_to_cache, v_to_cache
 
-    def mha_gen(self, compute_device, inputs, attention_mask, w_q, b_q, w_k, b_k, w_v, b_v,
-                w_out, b_out, w_ln, b_ln, n_head, k_cache, v_cache, donate,
-                attn_sparsity, compress_cache, comp_config):
-        """Multi-head attention (decoding phase)."""
-        # decompress weights
+    # MODIFICATION: 重写 mha_gen 以支持 GQA
+    # 中文注释: 此函数已重写以正确处理解码阶段的 GQA。
+    # 它现在能正确地从 GQA 格式的缓存中读取数据，并拼接新的 K/V。
+    def mha_gen(self, compute_device: TorchDevice, hidden_states: TorchTensor, attention_mask: TorchTensor,
+                w_q: TorchTensor, w_k: TorchTensor, w_v: TorchTensor, w_o: TorchTensor, w_norm: TorchTensor,
+                n_head: int, config: FlexModelConfig, donate: list, compress_cache: bool, comp_config: any,
+                k_cache: TorchTensor, v_cache: TorchTensor):
+
         if w_q.device.device_type == DeviceType.COMPRESSED:
-            w_q = w_q.device.decompress(w_q)
-            w_k = w_k.device.decompress(w_k)
-            w_v = w_v.device.decompress(w_v)
-            w_out = w_out.device.decompress(w_out)
+            w_q, w_k, w_v, w_o = [x.device.decompress(x) for x in [w_q, w_k, w_v, w_o]]
 
-        b, tgt_s, h = inputs.shape
+        bsz, tgt_s, h = hidden_states.shape
         src_s = attention_mask.shape[1]
-        head_dim = h // n_head
-        scaling = head_dim ** -0.5
+        n_q_head = n_head
+        n_kv_head = getattr(config, 'num_key_value_heads', n_q_head)
+        num_key_value_groups = n_q_head // n_kv_head
+        head_dim = h // n_q_head
+                       
+        residual = hidden_states.data
+        hidden_norm = self.rms_norm(hidden_states.data, w_norm.data, config.rms_norm_eps)
 
-        hidden = F.layer_norm(inputs.data, (h,), weight=w_ln.data, bias=b_ln.data)
+        q = F.linear(hidden_norm, w_q.data)
+        k = F.linear(hidden_norm, w_k.data)
+        v = F.linear(hidden_norm, w_v.data)
 
-        # shape: (b, 1, h)
-        q = F.linear(hidden, w_q.data, bias=b_q.data) * scaling
-        k = F.linear(hidden, w_k.data, bias=b_k.data)
-        v = F.linear(hidden, w_v.data, bias=b_v.data)
-        # shape: (b, 1, n_head, head_dim)
-        q = q.view(b, tgt_s, n_head, head_dim)
-        k = k.view(b, tgt_s, n_head, head_dim)
-        v = v.view(b, tgt_s, n_head, head_dim)
+        q = q.view(bsz, tgt_s, n_q_head, head_dim)
+        k = k.view(bsz, tgt_s, n_kv_head, head_dim)
+        v = v.view(bsz, tgt_s, n_kv_head, head_dim)
 
-        # shape: (b * n_head, 1, head_dim)
-        q = q.permute(0, 2, 1, 3).reshape(b * n_head, tgt_s, head_dim)
-        # shape: (1, b * n_head, head_dim)
-        k_new = k.permute(1, 0, 2, 3).reshape(tgt_s, b * n_head, head_dim)
-        # shape: (1, b * n_head, head_dim)
-        v_new = v.permute(1, 0, 2, 3).reshape(tgt_s, b * n_head, head_dim)
+        freqs_cis = compute_device.rotary_emb_cis[src_s - 1 : src_s]
+        q, k = self.apply_rotary_emb(q, k, freqs_cis=freqs_cis)
+        
+        q = q.permute(0, 2, 1, 3).reshape(bsz * n_q_head, tgt_s, head_dim)
+        k_new = k.permute(1, 0, 2, 3).reshape(tgt_s, bsz * n_kv_head, head_dim)
+        v_new = v.permute(1, 0, 2, 3).reshape(tgt_s, bsz * n_kv_head, head_dim)
 
-        if isinstance(k_cache, TorchTensor):
-            if attn_sparsity >= 1.0:  # Dense attention
-                if compress_cache:
-                    # shape: (s, b * n_head, head_dim)
-                    k = k_cache.device.decompress(k_cache)[:src_s]
-                    v = v_cache.device.decompress(v_cache)[:src_s]
-                else:
-                    # shape: (s, b * n_head, head_dim)
-                    k = k_cache.data[:src_s]
-                    v = v_cache.data[:src_s]
-                k[src_s - 1:src_s] = k_new
-                v[src_s - 1:src_s] = v_new
-
-                # shape: (b * n_head, head_dim, s)
-                k = k.permute(1, 2, 0).reshape(b * n_head, head_dim, src_s)
-                # shape: (b * n_head, s, head_dim)
-                v = v.permute(1, 0, 2).reshape(b * n_head, src_s, head_dim)
-
-                if k.is_cuda:
-                    value = self._attention_value(compute_device, q, k, v, attention_mask.data,
-                        b, src_s, tgt_s, n_head, head_dim)
-                else:
-                    q = q.float().cpu()
-                    k, v = k.float(), v.float()
-                    value = self._attention_value(compute_device, q, k, v, attention_mask.data,
-                        b, src_s, tgt_s, n_head, head_dim).cuda().half()
-            else:  # Sparse attention
-                # shape: (s, b * n_head, head_dim)
-                k = k_cache.data[:src_s]
-                k[src_s - 1:src_s] = k_new
-                # shape: (b * n_head, head_dim, s)
-                k = k.permute(1, 2, 0).reshape(b * n_head, head_dim, src_s)
-
-                if k.is_cuda:
-                    value = self._sparse_attention_value(compute_device, q, k, v_new, v_cache,
-                        attention_mask.data, b, src_s, tgt_s, n_head, head_dim,
-                        attn_sparsity)
-                else:
-                    q = q.float().cpu()
-                    value = self._sparse_attention_value(compute_device, q, k, v_new, v_cache,
-                        attention_mask.data, b, src_s, tgt_s, n_head, head_dim,
-                        attn_sparsity).cuda().half()
-        else:  # Mixed device attention
-            assert attn_sparsity >= 1.0
-            value = self._mixed_device_attention(compute_device, q, k_cache, v_cache,
-                k_new, v_new, attention_mask.data, b, src_s, tgt_s,
-                n_head, head_dim)
-
-        # shape: (b, 1, h)
-        value = value.transpose(1, 2).view(b, tgt_s, h)
-        value = F.linear(value, w_out.data, bias=b_out.data)
-
-        value.add_(inputs.data)
-
-        if donate[0]: inputs.delete()
+        if compress_cache:
+            k_cache_data = k_cache.device.decompress(k_cache)[:src_s-1]
+            v_cache_data = v_cache.device.decompress(v_cache)[:src_s-1]
+        else:
+            k_cache_data = k_cache.data[:src_s-1]
+            v_cache_data = v_cache.data[:src_s-1]
+        
+        k_all_seq = torch.cat([k_cache_data, k_new], dim=0)
+        v_all_seq = torch.cat([v_cache_data, v_new], dim=0)
+        
+        k_all = k_all_seq.permute(1, 2, 0)
+        v_all = v_all_seq.permute(1, 0, 2)
+        
+        if num_key_value_groups > 1:
+            k_all = k_all.view(bsz, n_kv_head, head_dim, src_s).repeat_interleave(num_key_value_groups, dim=1).view(bsz * n_q_head, head_dim, src_s)
+            v_all = v_all.view(bsz, n_kv_head, src_s, head_dim).repeat_interleave(num_key_value_groups, dim=1).view(bsz * n_q_head, src_s, head_dim)
+    
+        attn_weights = torch.bmm(q, k_all) / (head_dim ** 0.5)
+        
+        mask = attention_mask.data.view(bsz, 1, 1, src_s).expand(-1, n_q_head, -1, -1)
+        attn_weights = attn_weights.view(bsz, n_q_head, tgt_s, src_s)
+        attn_weights = attn_weights + mask
+        attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(v_all.dtype)
+        
+        value = torch.bmm(attn_weights.view(bsz * n_q_head, tgt_s, src_s), v_all)
+        value = value.view(bsz, n_q_head, tgt_s, head_dim).transpose(1, 2).reshape(bsz, tgt_s, h)
+        value = F.linear(value, w_o.data)
+        
+        value.add_(residual)
+        
+        if donate[0]: hidden_states.delete()
         if donate[1]: attention_mask.delete()
 
         if compress_cache:
-            if comp_config.group_dim == 0:
-                s_ = src_s // comp_config.group_size * comp_config.group_size
-                k_new = k[:, :, s_:].permute(2, 0, 1)
-                v_new = v[:, s_:, :].permute(1, 0, 2)
             k_new = compute_device.compressed_device.compress(k_new, comp_config)
             v_new = compute_device.compressed_device.compress(v_new, comp_config)
         else:
@@ -338,23 +212,42 @@ class LLaMAModelComputation:
             v_new = TorchTensor.create_from_torch(v_new, compute_device)
 
         return TorchTensor.create_from_torch(value, compute_device), k_new, v_new
+    def mlp(self, compute_device: TorchDevice, hidden_states: TorchTensor,
+            w_gate: TorchTensor, w_up: TorchTensor, w_down: TorchTensor, w_norm: TorchTensor,
+            config: FlexModelConfig, donate: list):
+        
+        if w_gate.device.device_type == DeviceType.COMPRESSED:
+            w_gate, w_up, w_down = [x.device.decompress(x) for x in [w_gate, w_up, w_down]]
 
-    def mlp(self, compute_device, inputs, wi, bi, wo, bo, w_ln, b_ln, donate):
-        # decompress weights
-        if wi.device.device_type == DeviceType.COMPRESSED:
-            wi = wi.device.decompress(wi)
-            wo = wo.device.decompress(wo)
+        residual = hidden_states.data
+        hidden_norm = self.rms_norm(hidden_states.data, w_norm.data, config.rms_norm_eps)
+        
+        act_fn = ACT2FN[config.hidden_act]
+        gate = F.linear(hidden_norm, w_gate.data)
+        up = F.linear(hidden_norm, w_up.data)
+        down = F.linear(act_fn(gate) * up, w_down.data)
+        
+        down.add_(residual)
+        if donate[0]: hidden_states.delete()
+        
+        return TorchTensor.create_from_torch(down, compute_device)
 
-        b, s, h = inputs.shape
+    def output_embed(self, compute_device: TorchDevice, hidden_states: TorchTensor, w_lm_head: TorchTensor, donate: list, do_sample: bool, temperature: float):
+        if w_lm_head.device.device_type == DeviceType.COMPRESSED:
+            w_lm_head = w_lm_head.device.decompress(w_lm_head)
 
-        out = F.layer_norm(inputs.data, (h,), weight=w_ln.data, bias=b_ln.data)
-        out = F.linear(out, wi.data, bias=bi.data)
-        F.relu(out, inplace=True)
-        out = F.linear(out, wo.data, bias=bo.data)
+        logits = F.linear(hidden_states.data, w_lm_head.data)
+        last_token_logits = logits[:,-1,:]
 
-        out.add_(inputs.data)
-        if donate[0]: inputs.delete()
-        return TorchTensor.create_from_torch(out, compute_device)
+        if do_sample and not temperature < 1e-5:
+            probs = torch.softmax(last_token_logits / temperature, dim=-1)
+            ids = torch.multinomial(probs, num_samples=1)
+        else:
+            ids = last_token_logits.argmax(dim=1, keepdim=True)
+            
+        if donate[0]: hidden_states.delete()
+        
+        return TorchTensor.create_from_torch(ids, compute_device), TorchTensor.create_from_torch(logits, compute_device)
 
 # Llama 2 模型与 OPT 的主要区别:
 # 1. 位置编码: 使用旋转位置编码 (Rotary Positional Embedding, RoPE)，在 Attention 层中应用，而不是独立的输入层。
@@ -390,8 +283,8 @@ class LlamaRMSNorm(BaseModelLayer):
                     k:List[Union[int, float]]):
         (w_norm,) = weight_home.val
         if k == 0:
-            dst = self.torch_device
-            weight_read_buf.store((w_norm.smart_copy(dst),))
+            dst = self.compute_device
+            weight_read_buf.store(w_norm.smart_copy(dst))
 
     def forward(self, 
                 hidden, 
@@ -401,8 +294,17 @@ class LlamaRMSNorm(BaseModelLayer):
                 cache_write_buf:ValueHolder, 
                 i: List[Union[int, float]], 
                 k: List[Union[int, float]]):
-        # TODO: 实现 RMSNorm 的前向计算
-        pass
+        
+        donate = [False] * 2
+        h, donate[0] = hidden.val, True
+        
+        if k == self.policy.num_gpu_batches - 1:
+            w_norm, donate[1] = weight_read_buf.pop()
+        else:
+            w_norm, _ = weight_read_buf.val
+        
+        h.data = self.computation.rms_norm(h.data, w_norm.data, self.config.rms_norm_eps)
+        hidden.val = h
 
 
 class LlamaInputEmbed(BaseModelLayer):
@@ -437,7 +339,7 @@ class LlamaInputEmbed(BaseModelLayer):
         w_token, = weight_home.val
         if k == 0:
             dst = self.weight_load_dst
-            weight_read_buf.store((w_token.smart_copy(dst),))
+            weight_read_buf.store(w_token.smart_copy(dst))
     
     def input_act_shape_and_dtype(self, batch_size, seq_len):
         return (batch_size, seq_len), np.int64
@@ -454,18 +356,17 @@ class LlamaInputEmbed(BaseModelLayer):
         
         # TODO: 实现词嵌入的前向计算
         # Compute input embedding
-        donate = [False] * 4
+        donate = [False] * 2
         h, donate[0] = hidden.val, True
-        mask, donate[1] = attention_mask.val.smart_copy(self.compute_device)
 
         if k == self.policy.num_gpu_batches - 1:
             # Clear the weight_read_buf if it is the last gpu batch
-            (w_token, donate[2]), (w_pos, donate[3]) = weight_read_buf.pop()
+            w_token, donate[1] = weight_read_buf.pop()
         else:
-            (w_token, _), (w_pos, _) = weight_read_buf.val
+            w_token, _ = weight_read_buf.val
 
-        h = self.computation.input_embed(self.compute_device, h, mask,
-            w_token, w_pos, self.config.pad_token_id, donate)
+        h = self.computation.input_embed(self.compute_device, h,
+            w_token, self.config.pad_token_id, donate)
         hidden.val = h
 
 class LlamaOutputEmbed(BaseModelLayer):
@@ -501,7 +402,7 @@ class LlamaOutputEmbed(BaseModelLayer):
         (w_lm_head,) = weight_home.val
         if k == 0:
             dst = self.weight_load_dst
-            weight_read_buf.store((w_lm_head.smart_copy(dst),))
+            weight_read_buf.store(w_lm_head.smart_copy(dst))
 
     def input_act_shape_and_dtype(self, batch_size, seq_len):
         return (batch_size, seq_len, self.config.input_dim), self.config.dtype
@@ -514,22 +415,22 @@ class LlamaOutputEmbed(BaseModelLayer):
                 cache_write_buf:ValueHolder, 
                 i: List[Union[int, float]], 
                 k: List[Union[int, float]]):
-        # TODO: 实现输出映射的前向计算
-        donate = [False] * 4
+        donate = [False] * 2
         h, donate[0] = hidden.val, True
-
+        
         if k == self.policy.num_gpu_batches - 1:
-            # Clear the weight_read_buf if it is the last gpu batch
-            (w_ln, donate[1]), (b_ln, donate[2]), (w_token, donate[3]) = weight_read_buf.pop()
+            w_lm_head, donate[1] = weight_read_buf.pop()
         else:
-            (w_ln, _), (b_ln, _), (w_token, _) = weight_read_buf.val
-
-        h, logits = self.computation.output_embed(self.compute_device, h, w_ln, b_ln, w_token, donate,
+            w_lm_head, _ = weight_read_buf.val
+            
+        h, logits = self.computation.output_embed(self.compute_device, h, w_lm_head, donate,
             self.task.do_sample, self.task.temperature)
         if self.task.logits:
             hidden.val = [h, logits]
         else:
             hidden.val = h
+
+
 class LlamaSelfAttention(BaseModelLayer):
     """Llama 的自注意力层，包含 RoPE。"""
     def __init__(self, 
@@ -547,12 +448,16 @@ class LlamaSelfAttention(BaseModelLayer):
                     weight_home:ValueHolder, 
                     converted_path: str):
         h = self.config.hidden_size
+        num_heads = self.config.n_head
+        num_kv_heads = getattr(self.config, 'num_key_value_heads', num_heads) # 如果没有就退化为 MHA
+        head_dim = h // num_heads
+        kv_dim = num_kv_heads * head_dim # 计算 K 和 V 的实际维度
         p = Path(converted_path)
         
         weight_specs = [
             ((h, h), "atten_q_proj", p / self.weight_map["q_proj"][0], self.config.dtype),
-            ((h, h), "atten_k_proj", p / self.weight_map["k_proj"][0], self.config.dtype),
-            ((h, h), "atten_v_proj", p / self.weight_map["v_proj"][0], self.config.dtype),
+            ((kv_dim, h), "atten_k_proj", p / self.weight_map["k_proj"][0], self.config.dtype),
+            ((kv_dim, h), "atten_v_proj", p / self.weight_map["v_proj"][0], self.config.dtype),
             ((h, h), "atten_o_proj", p / self.weight_map["o_proj"][0], self.config.dtype),
             ((h,), "atten_norm", p / self.weight_map["norm"][0], self.config.dtype),
         ]
@@ -591,8 +496,21 @@ class LlamaSelfAttention(BaseModelLayer):
             assert device.device_type != DeviceType.MIXED
             device = device.compressed_device
 
-        cache = device.init_cache_one_gpu_batch(self.config, self.task, self.policy)
-        cache_home.store(cache)
+        # cache = device.init_cache_one_gpu_batch(self.config, self.task, self.policy)
+        # cache_home.store(cache)
+        n_head = self.config.n_head
+        n_kv_head = getattr(self.config, 'num_key_value_heads', n_head)
+        head_dim = self.config.hidden_size // n_head
+        
+        prompt_len, gen_len = self.task.prompt_len, self.task.gen_len
+        gpu_batch_size = self.policy.gpu_batch_size
+        
+        shape = (prompt_len + gen_len - 1, gpu_batch_size * n_kv_head, head_dim)
+        
+        pin_memory = False
+        k_cache = device.allocate(shape, np.float16, pin_memory=pin_memory)
+        v_cache = device.allocate(shape, np.float16, pin_memory=pin_memory)
+        cache_home.store((k_cache, v_cache))
 
     def load_cache(self, 
                    cache_home:ValueHolder, 
@@ -694,8 +612,27 @@ class LlamaSelfAttention(BaseModelLayer):
                 cache_write_buf:ValueHolder, 
                 i:List[Union[int, float]], 
                 k:List[Union[int, float]]):
-        # TODO: 实现 Llama Attention 的前向计算 (包括 RoPE)
-        pass
+        donate = [False] * 7
+        h, donate[0] = hidden.val, True
+        
+        if k == self.policy.num_gpu_batches - 1:
+            (w_q, donate[2]), (w_k, donate[3]), (w_v, donate[4]), (w_o, donate[5]), (w_norm, donate[6]), = weight_read_buf.pop()
+        else:
+            (w_q, _), (w_k, _), (w_v, _), (w_o, _), (w_norm, _), = weight_read_buf.val
+
+        if i == 0:  # prefill
+            mask, donate[1] = attention_mask.val.smart_copy(self.compute_device)
+            h, new_k_cache, new_v_cache = self.computation.mha(self.compute_device, h, mask, w_q, w_k, w_v, w_o, w_norm,
+                self.config.n_head, self.config, donate, self.policy.compress_cache, self.policy.comp_cache_config)
+            cache_write_buf.store((new_k_cache, new_v_cache))
+        else: # decode
+            mask, donate[1] = attention_mask.val.smart_copy(self.attention_compute)
+            (k_cache, donate[6]), (v_cache, _) = cache_read_buf.pop()
+            h, new_k_cache, new_v_cache = self.computation.mha_gen(self.compute_device, h, mask, w_q, w_k, w_v, w_o, w_norm,
+                self.config.n_head, self.config, donate, self.policy.compress_cache, self.policy.comp_cache_config, k_cache, v_cache)
+            cache_write_buf.store((new_k_cache, new_v_cache))
+        
+        hidden.val = h
 
 class LlamaMLP(BaseModelLayer):
     """Llama 的 MLP 层，使用 SwiGLU。"""
@@ -747,8 +684,16 @@ class LlamaMLP(BaseModelLayer):
                 cache_write_buf:ValueHolder, 
                 i:List[Union[int, float]], 
                 k:List[Union[int, float]]):
-        # TODO: 实现 Llama MLP (SwiGLU) 的前向计算
-        pass
+        donate = [False] * 5
+        h, donate[0] = hidden.val, True
+        
+        if k == self.policy.num_gpu_batches - 1:
+            (w_gate, donate[1]), (w_up, donate[2]), (w_down, donate[3]), (w_norm, donate[4]), = weight_read_buf.pop()
+        else:
+            (w_gate, _), (w_up, _), (w_down, _), (w_norm, _), = weight_read_buf.val
+            
+        h = self.computation.mlp(self.compute_device, h, w_gate, w_up, w_down, w_norm, self.config, donate)
+        hidden.val = h
 
 
 class LlamaTransformerLayer(BaseTransformerLayer):
@@ -765,12 +710,36 @@ class LlamaTransformerLayer(BaseTransformerLayer):
         self.mlp = LlamaMLP(config, env, policy, weight_map['mlp'], self.computation)
 
     def init_weight(self, weight_home, path):
-        # TODO: 实现组合权重初始化
-        pass
+        home_attn, home_mlp = ValueHolder(), ValueHolder()
+        self.attention.init_weight(home_attn, path)
+        self.mlp.init_weight(home_mlp, path)
+        weight_home.store((home_attn, home_mlp))
     
     def load_weight(self, weight_home:ValueHolder, weight_read_buf:ValueHolder, k:List[Union[int, float]]):
-        # TODO: 实现组合权重加载
-        pass
+        read_buf_attn, read_buf_mlp = ValueHolder(), ValueHolder()
+        home_attn, home_mlp = weight_home.val
+        
+        self.attention.load_weight(home_attn, read_buf_attn, k)
+        self.mlp.load_weight(home_mlp, read_buf_mlp, k)
+        
+        if k == 0:
+            weight_read_buf.store((read_buf_attn, read_buf_mlp))
+    
+    def init_cache_one_gpu_batch(self, cache_home:ValueHolder):
+        self.attention.init_cache_one_gpu_batch(cache_home)
+
+    def load_cache(self, 
+                   cache_home:ValueHolder, 
+                   cache_read_buf:ValueHolder, 
+                   i:List[Union[int, float]]):
+        self.attention.load_cache(cache_home, cache_read_buf, i)
+
+    def store_cache(self, 
+                    cache_home:ValueHolder, 
+                    cache_write_buf:ValueHolder, 
+                    i:List[Union[int, float]]):
+        self.attention.store_cache(cache_home, cache_write_buf, i)
+
 
     def forward(self, 
                 hidden, 
@@ -789,7 +758,14 @@ class LlamaTransformerLayer(BaseTransformerLayer):
         # hidden = self.post_attention_layernorm(hidden, ...)
         # hidden = self.mlp(hidden, ...)
         # hidden = residual + hidden
-        pass
+        if k == self.policy.num_gpu_batches - 1:
+            read_buf_attn, read_buf_mlp = weight_read_buf.pop()
+        else:
+            read_buf_attn, read_buf_mlp = weight_read_buf.val
+
+        self.attention.forward(hidden, cache_read_buf, read_buf_attn, attention_mask,
+                               cache_write_buf, i, k)
+        self.mlp.forward(hidden, None, read_buf_mlp, attention_mask, None, i, k)
 
 
 class LlamaModel(BaseModel):
@@ -810,22 +786,17 @@ class LlamaModel(BaseModel):
         self.layers.append(LlamaOutputEmbed(self.config, self.env, self.policy, self.weight_map, self.computation))
 
 
-        if self.policy.act_gpu_percent == 100:
-            self.act_home = self.env.gpu
-        elif self.policy.act_cpu_percent == 100:
-            self.act_home = self.env.cpu
-        elif self.policy.act_disk_percent == 100:
-            self.act_home = self.env.disk
-        elif self.policy.act_numa_percent == 100:
-            self.act_home = self.env.numa
-        else:
-            raise NotImplementedError()
-
         self.init_cache_area() # 初始化用于保存权重 激活 cache 的内存区域
 
         self.task = None
+        s = getattr(self.config, "max_seq_len", None) or getattr(self.config, "max_position_embeddings", None)
 
-
+        # Precompute rotary embedding frequencies
+        self.compute_device.rotary_emb_cis = self.computation.precompute_freqs_cis(
+            self.config.hidden_size // self.config.n_head,
+            s * 2,
+            1.0 / (10000.0 ** (torch.arange(0, self.config.hidden_size // self.config.n_head, 2).float() / (self.config.hidden_size // self.config.n_head))).cuda()
+        )
         self.init_all_weights(flexgen_weight_path=self.path)
 
     def init_all_weights(self, flexgen_weight_path):
