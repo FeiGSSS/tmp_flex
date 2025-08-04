@@ -20,7 +20,7 @@ from flexgen.pytorch_backend import (TorchDevice, TorchDisk, TorchLink, TorchNum
 # from flex_model import init_weight_list, ValueHolder
 fix_recursive_import()
 
-class LLaMAModelComputation:
+class LlamaModelComputation:
     """
     此类封装了所有为 Llama 模型定义的计算逻辑。
     代码逻辑主要从 pytorch_backend_llama.py 迁移而来。
@@ -112,11 +112,22 @@ class LLaMAModelComputation:
         
         attn_weights = torch.bmm(q, k.transpose(1, 2)) / (head_dim ** 0.5)
         
-        mask = attention_mask.data.view(bsz, 1, 1, q_len).expand(-1, n_q_head, -1, -1)
+        # mask = attention_mask.data.view(bsz, 1, 1, q_len).expand(-1, n_q_head, -1, -1)
+        # attn_weights = attn_weights.view(bsz, n_q_head, q_len, q_len)
+        # attn_weights = attn_weights + mask
+        # attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(v.dtype)
+        idx = torch.arange(q_len, device=compute_device.dev)
+        causal_mask = (idx <= idx.view(q_len, 1)).view(1, 1, q_len, q_len)
+        padding_mask = attention_mask.data.view(bsz, 1, 1, q_len)
+        final_mask = padding_mask & causal_mask
+
         attn_weights = attn_weights.view(bsz, n_q_head, q_len, q_len)
-        attn_weights = attn_weights + mask
+        # 中文注释: 使用 torch.where 将掩码为 False 的位置替换为一个极小的负数
+        attn_weights = torch.where(final_mask, attn_weights, torch.tensor(torch.finfo(attn_weights.dtype).min, device=compute_device.dev))
+
         attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(v.dtype)
-        
+
+
         value = torch.bmm(attn_weights.view(bsz * n_q_head, q_len, q_len), v)
         value = value.view(bsz, n_q_head, q_len, head_dim).transpose(1, 2).reshape(bsz, q_len, h)
         value = F.linear(value, w_o.data)
@@ -190,11 +201,18 @@ class LLaMAModelComputation:
     
         attn_weights = torch.bmm(q, k_all) / (head_dim ** 0.5)
         
+        # mask = attention_mask.data.view(bsz, 1, 1, src_s).expand(-1, n_q_head, -1, -1)
+        # attn_weights = attn_weights.view(bsz, n_q_head, tgt_s, src_s)
+        # attn_weights = attn_weights + mask
+        # attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(v_all.dtype)
         mask = attention_mask.data.view(bsz, 1, 1, src_s).expand(-1, n_q_head, -1, -1)
         attn_weights = attn_weights.view(bsz, n_q_head, tgt_s, src_s)
-        attn_weights = attn_weights + mask
+        attn_weights = torch.where(mask, attn_weights, torch.tensor(torch.finfo(attn_weights.dtype).min, device=compute_device.dev))
+        
         attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(v_all.dtype)
         
+
+
         value = torch.bmm(attn_weights.view(bsz * n_q_head, tgt_s, src_s), v_all)
         value = value.view(bsz, n_q_head, tgt_s, head_dim).transpose(1, 2).reshape(bsz, tgt_s, h)
         value = F.linear(value, w_o.data)
@@ -262,7 +280,7 @@ class LlamaRMSNorm(BaseModelLayer):
                  env:ExecutionEnv, 
                  policy:Policy, 
                  weight_map:dict, 
-                 computation:LLaMAModelComputation):
+                 computation:LlamaModelComputation):
         super().__init__(config, env, policy, weight_map=weight_map)
         self.computation = computation # 待实现
 
@@ -314,7 +332,7 @@ class LlamaInputEmbed(BaseModelLayer):
                  env:ExecutionEnv, 
                  policy:Policy, 
                  weight_map:dict, 
-                 computation:LLaMAModelComputation):
+                 computation:LlamaModelComputation):
         super().__init__(config, env, policy, weight_map=weight_map)
         self.computation = computation # 待实现
 
@@ -376,7 +394,7 @@ class LlamaOutputEmbed(BaseModelLayer):
                  env:ExecutionEnv, 
                  policy:Policy, 
                  weight_map:dict, 
-                 computation:LLaMAModelComputation):
+                 computation:LlamaModelComputation):
         super().__init__(config, env, policy, weight_map=weight_map)
         self.computation = computation # 待实现
 
@@ -438,7 +456,7 @@ class LlamaSelfAttention(BaseModelLayer):
                  env:ExecutionEnv, 
                  policy:Policy, 
                  weight_map:dict, 
-                 computation:LLaMAModelComputation):
+                 computation:LlamaModelComputation):
         super().__init__(config, env, policy, weight_map=weight_map)
         self.attention_compute = (self.env.cpu if self.policy.cpu_cache_compute
             else self.env.gpu)
@@ -641,7 +659,7 @@ class LlamaMLP(BaseModelLayer):
                  env:ExecutionEnv, 
                  policy:Policy, 
                  weight_map:dict, 
-                 computation:LLaMAModelComputation):
+                 computation:LlamaModelComputation):
         super().__init__(config, env, policy, weight_map=weight_map)
         self.computation = computation # 待实现
 
@@ -703,7 +721,7 @@ class LlamaTransformerLayer(BaseTransformerLayer):
                  env:ExecutionEnv, 
                  policy:Policy, 
                  weight_map: dict, 
-                 computation:LLaMAModelComputation):
+                 computation:LlamaModelComputation):
         super().__init__(config, env, policy, weight_map)
         self.computation = computation
         self.attention = LlamaSelfAttention(config, env, policy, weight_map['attention'], self.computation)
@@ -777,7 +795,7 @@ class LlamaModel(BaseModel):
                  path:str):
         super().__init__(config, env, policy, weight_map=weight_map, path=path) 
 
-        self.computation = LLaMAModelComputation()
+        self.computation = LlamaModelComputation()
         self.layers.append(LlamaInputEmbed(self.config, self.env, self.policy, self.weight_map, self.computation))
         for layer_id in range(self.config.num_hidden_layers):
             self.layers.append(LlamaTransformerLayer(self.config, self.env, self.policy, self.weight_map['layers'][layer_id], self.computation))

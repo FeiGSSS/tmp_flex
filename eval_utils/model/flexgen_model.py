@@ -141,7 +141,7 @@ class flexgen_model(TemplateLM):
 
             # get self.config, which used in func self._get_backend and configure_pad_token(this func to configure self.tokenizer)
             self._get_config(
-                args.model,
+                args.path,
                 revision=revision,
                 trust_remote_code=trust_remote_code,
                 subfolder=subfolder,

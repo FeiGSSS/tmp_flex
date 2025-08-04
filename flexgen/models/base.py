@@ -184,6 +184,7 @@ class BaseModel:
         # 这个 TypeError 只会在解释器关闭、模块已被卸载时发生。
         # 此时程序即将退出，内存将由操作系统回收，
         # 所以我们可以安全地忽略这个错误，以避免程序崩溃。
+            
             pass
     
     def init_cache(self, 
@@ -301,6 +302,10 @@ class BaseModel:
                 ids = self.hidden[i][j][k].pop().data.detach().cpu().numpy()
                 logits = None
             pos = self.task.prompt_len + i
+
+            if logits is not None:
+                self.logits[left:right] = logits
+
             if self.task.stop:
                 stopped = self.stopped[left:right]
                 self.output_ids[left:right, pos:pos+1] = np.where(

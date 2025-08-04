@@ -13,7 +13,7 @@ from transformers import AutoTokenizer
 
 from flexgen.models import get_model_architecture
 from flexgen.models.load_convert.load_weight import AutoFlexModel
-from flexgen.models.utils import Policy, ExecutionEnv
+from flexgen.models.utils import Policy, ExecutionEnv, get_tokenizer
 from flexgen.pytorch_backend import (TorchDevice, TorchTensor, TorchDisk, TorchNuma, TorchMixedDevice, 
                                      fix_recursive_import, print_memory_copy_stats)
 from flexgen.utils import (str2bool, project_decode_latency, write_benchmark_log, get_filename,  
@@ -84,17 +84,16 @@ def get_test_inputs(prompt_len, num_prompts, tokenizer):
 
 def run_flexgen(args):
     print(f"<run_flexgen>: args.model: {args.model}")
-    if args.model == "facebook/galactica-30b":
-        tokenizer = AutoTokenizer.from_pretrained("facebook/galactica-30b", padding_side="left")
-    else:
-        tokenizer = AutoTokenizer.from_pretrained("facebook/opt-30b", padding_side="left")
+    # if args.model == "facebook/galactica-30b":
+    #     tokenizer = AutoTokenizer.from_pretrained("facebook/galactica-30b", padding_side="left")
+    # else:
+    #     tokenizer = AutoTokenizer.from_pretrained("facebook/opt-30b", padding_side="left")
     # tokenizer = AutoTokenizer.from_pretrained(args.path, padding_side="left")
     num_prompts = args.num_gpu_batches * args.gpu_batch_size
     prompt_len, gen_len, cut_gen_len = args.prompt_len, args.gen_len, args.cut_gen_len
 
     # Task and policy
-    warmup_inputs = get_test_inputs(32, num_prompts, tokenizer)
-    inputs = get_test_inputs(prompt_len, num_prompts, tokenizer)
+    
 
     gpu = TorchDevice("cuda:0")
     cpu = TorchDevice("cpu")
@@ -130,6 +129,11 @@ def run_flexgen(args):
     print(f"model size: {model_config.model_bytes()/GB:.3f} GB, "
           f"cache size: {cache_size/GB:.3f} GB, "
           f"hidden size (prefill): {hidden_size/GB:.3f} GB")
+
+    tokenizer = get_tokenizer(args.path)
+    # tokenizer = AutoTokenizer.from_pretrained(args.path)
+    warmup_inputs = get_test_inputs(32, num_prompts, tokenizer)
+    inputs = get_test_inputs(prompt_len, num_prompts, tokenizer)
 
     print("load weight...")
     model = get_model_architecture(config=model_config, path=converted_path, policy=policy, env=env, weight_map=weight_map)
