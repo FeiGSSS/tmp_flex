@@ -938,6 +938,8 @@ class HFLM(TemplateLM):
                 timers("generate").reset()
                 timers("generate").start()
                 logits = self.model(inps).logits
+                # print(f"logits are: {logits}");exit()
+                # torch.save(logits, "");exit()
                 timers("generate").stop()
                 time_costs = timers("generate").costs
                 num_prompts, prompt_len = inps.shape

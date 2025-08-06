@@ -67,14 +67,14 @@ def save_param_as_numpy(param, output_dir, flexgen_name):
     # print(param.dtype)
     if isinstance(param, torch.Tensor):
         if param.dtype == torch.bfloat16:
-            param = param.type(torch.float16)
+            param = param.type(torch.float32)
         param_np = param.cpu().detach().numpy()
     else:
         param_np = param
 
     # FlexGen的权重通常是FP16
-    if param_np.dtype != np.float16:
-        param_np = param_np.astype(np.float16)
+    if param_np.dtype != np.float32:
+        param_np = param_np.astype(np.float32)
 
     param_path = Path(output_dir) / flexgen_name
     with open(param_path, "wb") as f:

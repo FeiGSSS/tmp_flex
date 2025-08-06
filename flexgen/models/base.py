@@ -730,6 +730,7 @@ class BaseModel:
             temperature=temperature,
             stop=stop,
         )
+        # print(task.__dict__)
         tmp_batch_size = None
         if self.policy.gpu_batch_size * self.num_gpu_batches != len(task.inputs):
             tmp_batch_size = self.policy.gpu_batch_size

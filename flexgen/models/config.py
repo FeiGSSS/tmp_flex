@@ -101,7 +101,7 @@ class FlexModelConfigFactory:
                 n_head=config["num_attention_heads"],
                 num_hidden_layers=config["num_hidden_layers"],
                 ffn_embed_dim=config["intermediate_size"],
-                dtype=np.float16,
+                dtype=np.float32,
                 
                 vocab_size=config["vocab_size"],
                 num_key_value_heads=config.get("num_key_value_heads", config["num_attention_heads"]),
@@ -136,7 +136,7 @@ class FlexModelConfigFactory:
                 num_key_value_heads=config.get("num_key_value_heads", config["num_attention_heads"]),
                 rms_norm_eps=config.get("layer_norm_eps", 1e-5), # OPT uses layer_norm_eps
                 mlp_type='GELU-MLP',
-                dtype=np.float16,
+                dtype=np.float32,
                 normalization_type='LayerNorm',
                 positional_embedding_type='Absolute',
                 layer_name_map={

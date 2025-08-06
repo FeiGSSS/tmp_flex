@@ -26,9 +26,9 @@ from flexgen.timer import timers
 fix_recursive_import()
 
 def add_parser_arguments(parser:argparse.ArgumentParser):
-    parser.add_argument("--model", type=str, default="facebook/opt-125m",
+    parser.add_argument("--model", type=str, default="llama2-7b",
         help="The model name.")
-    parser.add_argument("--path", type=str, default="/shared/model/opt/opt-125m",
+    parser.add_argument("--path", type=str, default="/shared/model/Llama-2-7b-hf",
         help="The path to the model weights. If there are no cached weights, "
              "flexgen will automatically download them from HuggingFace.")
     parser.add_argument("--offload-dir", type=str, default="~/flexgen_offload_dir",
@@ -39,7 +39,7 @@ def add_parser_arguments(parser:argparse.ArgumentParser):
         help="Cut generation length for fast debugging.")
     parser.add_argument("--debug-mode", type=str,
         choices=["fewer_batch", "breakdown"])
-    parser.add_argument("--gpu-batch-size", type=int, default=26)
+    parser.add_argument("--gpu-batch-size", type=int, default=2)
     parser.add_argument("--num-gpu-batches", type=int, default=1)
     parser.add_argument("--percent", nargs="+", type=int,
         default=[100, 0, 0, 100, 0, 0, 100, 0, 0],

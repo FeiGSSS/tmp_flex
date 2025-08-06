@@ -505,6 +505,7 @@ class flexgen_model(TemplateLM):
                 inps = inps.cpu()
                 timers("generate").reset()
                 _, logits = self.model.get_logits(inps)
+                # print(logits);exit()
                 # print(f"logits are: {logits}, logits dtype: {logits.dtype}, logits shape: {logits.shape} \n =======*******")
                 # exit()
                 time_costs = timers("generate").costs
