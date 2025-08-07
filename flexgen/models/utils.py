@@ -5,7 +5,7 @@ from typing import Union, Optional, Any, Sequence, List
 from transformers import AutoTokenizer, PreTrainedTokenizer, PreTrainedTokenizerFast
 
 
-from flexgen.utils import torch_dtype_to_np_dtype, DUMMY_WEIGHT, GB
+from flexgen.utils import str_to_dtype, torch_dtype_to_np_dtype, np_dtype_to_torch_dtype, DUMMY_WEIGHT, GB
 from flexgen.compression import CompressionConfig
 
 # DUMMY_WEIGHT = "_DUMMY_"  # Use dummy weights for benchmark purposes
@@ -106,7 +106,7 @@ class ExecutionEnv:
 # 定义一个常见的仅解码器模型架构列表，用于判断
 # 这个列表可以根据需要进行扩充
 DECODER_ONLY_ARCHITECTURES = [
-    "LlamaForCausalLM",
+    # "LlamaForCausalLM",
     "GPT2LMHeadModel",
     "GPTJForCausalLM",
     "GPTNeoXForCausalLM",
@@ -207,6 +207,7 @@ def init_weight_list(weight_specs, policy, env):
         mid_percent = (sizes_cumsum[i] - sizes[i] / 2) / sizes_cumsum[-1]
         home = get_choice(mid_percent * 100, dev_percents, dev_choices)
         shape, name, filename, dtype = weight_specs[i]
+        dtype = str_to_dtype[dtype] if isinstance(dtype, str) else dtype
 
         if len(shape) < 2:
             pin_memory = True
@@ -216,14 +217,17 @@ def init_weight_list(weight_specs, policy, env):
             compress = policy.compress_weight
 
         if not compress:
+            dtype = torch_dtype_to_np_dtype[dtype]
             weight = home.allocate(shape, dtype, pin_memory=pin_memory)
 
             if DUMMY_WEIGHT not in str(filename):
                 weight.load_from_np_file(weight_specs[i][2])
             else:
+                dtype = torch_dtype_to_np_dtype[dtype]
                 weight.load_from_np(np.ones(shape, dtype))
                 #weight.load_from_np(np.random.rand(*shape).astype(dtype))
         else:
+            dtype = torch_dtype_to_np_dtype[dtype]
             weight = home.compressed_device.allocate(
                 shape, dtype, policy.comp_weight_config, pin_memory=pin_memory)
 

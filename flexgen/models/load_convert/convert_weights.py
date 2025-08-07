@@ -61,24 +61,29 @@ def load_state_dict_and_config(model_path: str):
     
     raise FileNotFoundError(f"No valid model files (.bin, .safetensors, .gguf) found in {model_path}")
 
-def save_param_as_numpy(param, output_dir, flexgen_name):
+def save_param_as_numpy(param, output_dir, flexgen_name, data_dtype):
     """将张量保存为NumPy格式"""
     # GGUF 张量已经是 numpy, PyTorch 张量需要转换
     # print(param.dtype)
+    param_path = Path(output_dir) / flexgen_name
+    data_dtype[flexgen_name] = str(param.dtype)
     if isinstance(param, torch.Tensor):
         if param.dtype == torch.bfloat16:
+            # print(param.dtype)
             param = param.type(torch.float32)
         param_np = param.cpu().detach().numpy()
     else:
         param_np = param
 
-    # FlexGen的权重通常是FP16
-    if param_np.dtype != np.float32:
-        param_np = param_np.astype(np.float32)
-
-    param_path = Path(output_dir) / flexgen_name
+    # # FlexGen的权重通常是FP16
+    # if param_np.dtype != np.float32:
+    #     param_np = param_np.astype(np.float32)
     with open(param_path, "wb") as f:
         np.save(f, param_np)
+
+    # param_path = Path(output_dir) / flexgen_name
+    # with open(param_path, "wb") as f:
+    #     np.save(f, param.cpu().detach().numpy())
 
 
 def convert(model_path: str, output_path: str):
@@ -104,10 +109,10 @@ def convert(model_path: str, output_path: str):
             {"attention": {}, "mlp": {}} for _ in range(config.num_hidden_layers)
         ]
     }
-
+    data_dtype = {}
     for raw_name, param in tqdm(state_dict.items(), desc="Converting Tensors"):
 
-        save_param_as_numpy(param, output_path, raw_name)
+        save_param_as_numpy(param, output_path, raw_name, data_dtype)
             # shared embedding
         # if "embed_tokens.weight" in raw_name:
         #     shutil.copy(output_path, output_path.replace(
@@ -134,17 +139,18 @@ def convert(model_path: str, output_path: str):
                     standard_name = flexgen_name_template.split('_', 1)[1]
                     # 在清单中记录此权重的原始文件名
                     if raw_name.replace('weight', 'bias') in state_dict:
-                        weight_map['layers'][i][component][standard_name] = [raw_name, raw_name.replace('weight', 'bias')]
+                        weight_map['layers'][i][component][standard_name] = [raw_name, raw_name.replace('weight', 'bias'), data_dtype[raw_name], data_dtype[raw_name.replace('weight', 'bias')]]
                     else:
-                        weight_map['layers'][i][component][standard_name] = [raw_name]
+                        weight_map['layers'][i][component][standard_name] = [raw_name, data_dtype[raw_name]]
         else: # 处理非循环/全局权重
             raw_name = raw_name_template
             if raw_name in state_dict:
                 # 在清单中记录此权重的原始文件名
                 if raw_name.replace('weight', 'bias') in state_dict:
-                    weight_map[flexgen_name_template] = [raw_name, raw_name.replace('weight', 'bias')] 
+                    weight_map[flexgen_name_template] = [raw_name, raw_name.replace('weight', 'bias'), data_dtype[raw_name], data_dtype[raw_name.replace('weight', 'bias')]]
                 else:
-                    weight_map[flexgen_name_template] = [raw_name] 
+                    weight_map[flexgen_name_template] = [raw_name, data_dtype[raw_name]]
+        # print(weight_map[flexgen_name_template]);exit()
 
     # --- 步骤 3: 保存 config 和 weight_map ---
     with open(Path(output_path) / "weight_map.json", "w") as f:

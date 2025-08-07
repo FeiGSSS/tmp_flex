@@ -96,9 +96,9 @@ class LlamaModelComputation:
         # Matmul: (b, n_head, 1, head_dim) @ (b, n_head, head_dim, src_s) -> (b, n_head, 1, src_s)
         attn_weights = torch.matmul(q, k_t)  # (b, n_head, 1, src_s)
 
-        # Scale by sqrt(d_k)
-        head_dim = q.size(-1)
-        attn_weights = attn_weights / (head_dim ** 0.5)
+        # # Scale by sqrt(d_k)
+        # head_dim = q.size(-1)
+        # attn_weights = attn_weights / (head_dim ** 0.5)
 
         # # Expand mask if needed
         # if mask.dim() == 3:  # (b, 1, src_s)
@@ -245,6 +245,107 @@ class LlamaModelComputation:
 
         return value
     
+    
+    
+    
+    # def _attention_weights(self, q, k, mask, b, src_s, n_head):
+    #     # shape: (b * n_head, 1, s)
+    #     attn_weights = torch.bmm(q, k)
+    #     # shape: (b, 1, 1, s)
+    #     mask = mask.view(b, 1, 1, src_s)
+    #     # shape: (b * n_head, 1, s)
+    #     attn_weights = attn_weights.view(b, n_head, 1, src_s)
+    #     attn_weights = torch.where(mask, attn_weights, -1e4)
+    #     attn_weights = attn_weights.view(b * n_head, 1, src_s)
+    #     attn_weights = F.softmax(attn_weights, dim=2)
+    #     return attn_weights
+    
+    # def _attention_value(self, q, k, v, mask, b, src_s, tgt_s, n_head, head_dim):
+    #     # shape: (b * n_head, 1, s)
+    #     attn_weights = self._attention_weights(q, k, mask, b, src_s, n_head)
+    #     # shape: (b, n_head, 1, head_dim)
+    #     return torch.bmm(attn_weights, v).view(b, n_head, tgt_s, head_dim)
+
+    # def _sparse_attention_value(self, q, k, v_new, v_cache, mask, b,
+    #                             src_s, tgt_s, n_head, head_dim, attn_sparsity):
+    #     # shape: (b * n_head, 1, s)
+    #     attn_weights = self._attention_weights(q, k, mask, b, src_s, n_head)
+    #     topk = int(attn_sparsity * (attn_weights.shape[2] - 1))
+    #     topk_weights, topk_indices = attn_weights[:, :, :-1].topk(
+    #         topk, dim=2, sorted=False)
+    #     topk_indices = topk_indices.view(b * n_head, topk).transpose(0, 1)
+    #     # shape: (b * n_head, 1, topk+1)
+    #     attn_weights = torch.cat([topk_weights,
+    #         attn_weights[:, :, -1].unsqueeze(-1)], dim=-1)
+
+    #     if k.is_cuda:
+    #         v_home = v_cache
+    #         v_buf = self.allocate((topk+1, b*n_head, head_dim), np.float16)
+    #         topk_indices = topk_indices.cpu()
+    #     else:
+    #         (v_home, v_buf) = v_cache
+
+    #     # shape: (s, b * n_head, head_dim)
+    #     indices_src = topk_indices
+    #     indices_tgt = (slice(0, indices_src.shape[0]), slice(0, v_home.shape[1]))
+    #     general_copy(v_buf, indices_tgt, v_home, indices_src)
+    #     v_home.device.synchronize()
+
+    #     # shape: (topk+1, b * n_head, head_dim)
+    #     v = v_buf.data[:topk+1]
+    #     v[topk:topk+1] = v_new
+    #     # shape: (b * n_head, topk+1, head_dim)
+    #     v = v.permute(1, 0, 2).reshape(b * n_head, topk+1, head_dim)
+
+    #     # shape: (b * n_head, 1, head_dim)
+    #     return torch.bmm(attn_weights, v).view(b, n_head, tgt_s, head_dim)
+
+    # def _mixed_device_attention(self, q, k_cache, v_cache, k_new, v_new,
+    #         mask, b, src_s, tgt_s, n_head, head_dim):
+    #     # The caches are stored on both gpu and cpu.
+    #     # Compute attention on gpu for caches stored on gpu.
+    #     # Compute attention on cpu for caches stored on cpu.
+    #     k_gpu, k_cpu = k_cache[0].data, k_cache[1].data
+    #     v_gpu, v_cpu = v_cache[0].data, v_cache[1].data
+    #     seg = k_gpu.shape[1]
+
+    #     # Compute GPU part
+    #     b_gpu = seg // n_head
+    #     q_gpu = q[:seg]
+    #     # shape: (s, b * n_head, head_dim)
+    #     k_gpu = k_gpu[:src_s, :seg, :]
+    #     v_gpu = v_gpu[:src_s, :seg, :]
+    #     k_gpu[src_s-1:src_s, :, :] = k_new[:, :seg, :]
+    #     v_gpu[src_s-1:src_s, :, :] = v_new[:, :seg, :]
+    #     # shape: (b * n_head, head_dim, s)
+    #     k_gpu = k_gpu.permute(1, 2, 0)
+    #     # shape: (b * n_head, s, head_dim)
+    #     v_gpu = v_gpu.permute(1, 0, 2)
+
+    #     mask_gpu = mask[:b_gpu].cuda()
+    #     value_gpu = self._attention_value(q_gpu, k_gpu, v_gpu, mask_gpu,
+    #         b_gpu, src_s, tgt_s, n_head, head_dim)
+
+    #     # Compute CPU Part
+    #     b_cpu = b - b_gpu
+    #     q_cpu = q[seg:].float().cpu()
+    #     # shape: (s, b * n_head, head_dim)
+    #     k_cpu = k_cpu[:src_s, seg:, :]
+    #     v_cpu = v_cpu[:src_s, seg:, :]
+    #     k_cpu[src_s-1:src_s, :, :] = k_new[:, seg:, :]
+    #     v_cpu[src_s-1:src_s, :, :] = v_new[:, seg:, :]
+    #     # shape: (b * n_head, head_dim, s)
+    #     k_cpu = k_cpu.permute(1, 2, 0)
+    #     # shape: (b * n_head, s, head_dim)
+    #     v_cpu = v_cpu.permute(1, 0, 2)
+
+    #     mask_cpu = mask[b_gpu:]
+    #     value_cpu = self._attention_value(q_cpu, k_cpu, v_cpu, mask_cpu,
+    #         b_cpu, src_s, tgt_s, n_head, head_dim)
+
+    #     value = torch.cat([value_gpu, value_cpu.cuda().half()], dim=0)
+    #     return value
+    
     def input_embed(self, compute_device: TorchDevice, inputs: TorchTensor, w_token: TorchTensor, pad_token_id: int, donate: list):
         if w_token.device.device_type == DeviceType.COMPRESSED:
             w_token = w_token.device.decompress(w_token)
@@ -271,12 +372,13 @@ class LlamaModelComputation:
         n_kv_head = getattr(config, 'num_key_value_heads', n_q_head)
         num_key_value_groups = n_q_head // n_kv_head
         head_dim = h // n_q_head
+        scaling = head_dim ** -0.5
         
         residual = hidden_states.data
         hidden_norm = self.rms_norm(residual, norm_weight=w_norm.data, eps=config.rms_norm_eps)
         
         # shape: (b, s, h)
-        q = F.linear(hidden_norm, w_q.data)
+        q = F.linear(hidden_norm, w_q.data) * scaling
         k = F.linear(hidden_norm, w_k.data)
         v = F.linear(hidden_norm, w_v.data)
 
@@ -289,6 +391,47 @@ class LlamaModelComputation:
         # 应用RoPE
         q, k = self.apply_rotary_emb(q, k, freqs_cis=compute_device.rotary_emb_cis[:seq_len])
 
+        # # shape: (b * n_head, s, head_dim)
+        # q = q.permute(0, 2, 1, 3).reshape(bsz * n_head, seq_len, head_dim)
+        # # shape: (b * n_head, head_dim, s)
+        # k = k.permute(0, 2, 3, 1).reshape(bsz * n_head, head_dim, seq_len)
+        # # shape: (b * n_head, s, head_dim)
+        # v = v.permute(0, 2, 1, 3).reshape(bsz * n_head, seq_len, head_dim)
+
+        # attn_weights = torch.bmm(q, k)
+
+        # idx = torch.arange(seq_len).to(compute_device.dev)
+        # causal_mask = (idx <= idx.view(seq_len, 1)).view(1, 1, seq_len, seq_len)
+        # mask = attention_mask.data.view(bsz, 1, 1, seq_len) & causal_mask
+
+        # # shape: (b, n_head, s, s)
+        # attn_weights = attn_weights.view(bsz, n_head, seq_len, seq_len)
+        # attn_weights = torch.where(mask, attn_weights, -1e4)
+        # attn_weights = attn_weights.view(bsz * n_head, seq_len, seq_len)
+        # attn_weights = F.softmax(attn_weights, dim=2)
+        # # shape: (b, n_head, s, head_dim)
+        # value = torch.bmm(attn_weights, v).view(bsz, n_head, seq_len, head_dim)
+        # # shape: (b, s, h)
+        # value = value.transpose(1, 2).reshape(bsz, seq_len, h)
+        # value = F.linear(value, w_o.data)
+
+        # value.add_(hidden_states.data)
+
+        # if donate[0]: hidden_states.delete()
+        # if donate[1]: attention_mask.delete()
+
+        # # (s, b * n_head, head_dim)
+        # k = k.permute(2, 0, 1)
+        # v = v.permute(1, 0, 2)
+
+        # if compress_cache:
+        #     k = self.compressed_device.compress(k, comp_config)
+        #     v = self.compressed_device.compress(v, comp_config)
+        # else:
+        #     k = TorchTensor.create_from_torch(k, compute_device)
+        #     v = TorchTensor.create_from_torch(v, compute_device)
+
+        # return TorchTensor.create_from_torch(value, compute_device), k, v
         # 先将原始的 K 和 V 保存起来, 以便之后存入缓存
         k_for_cache = k # shape: (b, s, n_head, head_dim)
         v_for_cache = v # shape: (b, s, n_head, head_dim)
@@ -347,6 +490,7 @@ class LlamaModelComputation:
                 n_head: int, config: FlexModelConfig, donate: list, compress_cache: bool, comp_config: any,
                 attn_sparsity:Union[int, float], k_cache: Union[TorchTensor, ValueHolder], v_cache: Union[TorchTensor, ValueHolder]):
 
+        
         if w_q.device.device_type == DeviceType.COMPRESSED:
             w_q, w_k, w_v, w_o, w_norm = [x.device.decompress(x) for x in [w_q, w_k, w_v, w_o, w_norm]]
 
@@ -356,12 +500,13 @@ class LlamaModelComputation:
         n_kv_head = getattr(config, 'num_key_value_heads', n_q_head)
         num_key_value_groups = n_q_head // n_kv_head
         head_dim = h // n_q_head
+        scaling = head_dim ** -0.5
                        
         residual = hidden_states.data # shape (bsz, tgt_s, h)
         hidden_norm = self.rms_norm(residual, norm_weight=w_norm.data, eps=config.rms_norm_eps)
 
         # 1. 计算当前步的 Q, K, V
-        q = F.linear(hidden_norm, w_q.data) # shape: (bsz, tgt_s, h)
+        q = F.linear(hidden_norm, w_q.data) * scaling # shape: (bsz, tgt_s, h)
         k_new = F.linear(hidden_norm, w_k.data) # shape: (bsz, tgt_s, h)
         v_new = F.linear(hidden_norm, w_v.data) # shape: (bsz, tgt_s, h)
 
@@ -369,7 +514,7 @@ class LlamaModelComputation:
         k_new = k_new.view(bsz, tgt_s, n_kv_head, head_dim) # shape: (bsz, tgt_s, n_head, head_dim)
         v_new = v_new.view(bsz, tgt_s, n_kv_head, head_dim) # shape: (bsz, tgt_s, n_head, head_dim)
 
-        q, k_new = self.apply_rotary_emb(q, k_new, freqs_cis=compute_device.rotary_emb_cis[src_s-1:src_s])
+        q, k_new = self.apply_rotary_emb(q, k_new, freqs_cis=compute_device.rotary_emb_cis[src_s:src_s+tgt_s])
         q_for_attn = q.transpose(1, 2) # shape: (bsz, n_head, tgt_s, head_dim)
 
         if isinstance(k_cache, TorchTensor):
@@ -452,6 +597,106 @@ class LlamaModelComputation:
 
         return TorchTensor.create_from_torch(output, compute_device), k_new_to_cache, v_new_to_cache
     
+        # """Multi-head attention (decoding phase)."""
+        # # decompress weights
+        # if w_q.device.device_type == DeviceType.COMPRESSED:
+        #     w_q = w_q.device.decompress(w_q)
+        #     w_k = w_k.device.decompress(w_k)
+        #     w_v = w_v.device.decompress(w_v)
+        #     w_out = w_out.device.decompress(w_out)
+
+        # b, tgt_s, h = hidden_states.shape
+        # src_s = attention_mask.shape[1]
+        # head_dim = h // n_head
+        # # freq_cis = self.precompute_freqs_cis(head_dim, 2048 * 2, rotary_emb_inv_freq.data)
+        # scaling = head_dim ** -0.5
+
+        # hidden = self.rms_norm(hidden_states.data, w_norm.data)
+        # # hidden = F.layer_norm(inputs.data, (h,), weight=input_layernorm.data)
+
+        # # shape: (b, 1, h)
+        # q = F.linear(hidden, w_q.data) * scaling
+        # k = F.linear(hidden, w_k.data)
+        # v = F.linear(hidden, w_v.data)
+        # # shape: (b, 1, n_head, head_dim)
+        # q = q.view(b, tgt_s, n_head, head_dim)
+        # k = k.view(b, tgt_s, n_head, head_dim)
+        # v = v.view(b, tgt_s, n_head, head_dim)
+        # q, k = self.apply_rotary_emb(q, k, freqs_cis=compute_device.rotary_emb_cis[src_s:src_s+tgt_s])
+
+        # # shape: (b * n_head, 1, head_dim)
+        # q = q.permute(0, 2, 1, 3).reshape(b * n_head, tgt_s, head_dim)
+        # # shape: (1, b * n_head, head_dim)
+        # k_new = k.permute(1, 0, 2, 3).reshape(tgt_s, b * n_head, head_dim)
+        # # shape: (1, b * n_head, head_dim)
+        # v_new = v.permute(1, 0, 2, 3).reshape(tgt_s, b * n_head, head_dim)
+        # if isinstance(k_cache, TorchTensor):
+        #     if attn_sparsity >= 1.0:  # Dense attention
+        #         if compress_cache:
+        #             # shape: (s, b * n_head, head_dim)
+        #             k = k_cache.device.decompress(k_cache)[:src_s]
+        #             v = v_cache.device.decompress(v_cache)[:src_s]
+        #         else:
+        #             # shape: (s, b * n_head, head_dim)
+        #             k = k_cache.data[:src_s]
+        #             v = v_cache.data[:src_s]
+        #         k[src_s - 1:src_s] = k_new
+        #         v[src_s - 1:src_s] = v_new
+        #         # shape: (b * n_head, head_dim, s)
+        #         k = k.permute(1, 2, 0).reshape(b * n_head, head_dim, src_s)
+        #         # shape: (b * n_head, s, head_dim)
+        #         v = v.permute(1, 0, 2).reshape(b * n_head, src_s, head_dim)
+        #         if k.is_cuda:
+        #             value = self._attention_value(q, k, v, attention_mask.data,
+        #                 b, src_s, tgt_s, n_head, head_dim)
+        #         else:
+        #             q = q.float().cpu()
+        #             k, v = k.float(), v.float()
+        #             value = self._attention_value(q, k, v, attention_mask.data,
+        #                 b, src_s, tgt_s, n_head, head_dim).cuda().half()
+        #     else:  # Sparse attention
+        #         # shape: (s, b * n_head, head_dim)
+        #         k = k_cache.data[:src_s]
+        #         k[src_s - 1:src_s] = k_new
+        #         # shape: (b * n_head, head_dim, s)
+        #         k = k.permute(1, 2, 0).reshape(b * n_head, head_dim, src_s)
+
+        #         if k.is_cuda:
+        #             value = self._sparse_attention_value(q, k, v_new, v_cache,
+        #                 attention_mask.data, b, src_s, tgt_s, n_head, head_dim,
+        #                 attn_sparsity)
+        #         else:
+        #             q = q.float().cpu()
+        #             value = self._sparse_attention_value(q, k, v_new, v_cache,
+        #                 attention_mask.data, b, src_s, tgt_s, n_head, head_dim,
+        #                 attn_sparsity).cuda().half()
+        # else:  # Mixed device attention
+        #     assert attn_sparsity >= 1.0
+        #     value = self._mixed_device_attention(q, k_cache, v_cache,
+        #         k_new, v_new, attention_mask.data, b, src_s, tgt_s,
+        #         n_head, head_dim)
+
+        # # shape: (b, 1, h)
+        # value = value.transpose(1, 2).view(b, tgt_s, h)
+        # value = F.linear(value, w_out.data)
+
+        # value.add_(hidden_states.data)
+
+        # if donate[0]: hidden_states.delete()
+        # if donate[1]: attention_mask.delete()
+
+        # if compress_cache:
+        #     if comp_config.group_dim == 0:
+        #         s_ = src_s // comp_config.group_size * comp_config.group_size
+        #         k_new = k[:, :, s_:].permute(2, 0, 1)
+        #         v_new = v[:, s_:, :].permute(1, 0, 2)
+        #     k_new = self.compressed_device.compress(k_new, comp_config)
+        #     v_new = self.compressed_device.compress(v_new, comp_config)
+        # else:
+        #     k_new = TorchTensor.create_from_torch(k_new, compute_device)
+        #     v_new = TorchTensor.create_from_torch(v_new, compute_device)
+
+        # return TorchTensor.create_from_torch(value, compute_device), k_new, v_new
     
     def mha_gen_old(self, compute_device: TorchDevice, hidden_states: TorchTensor, attention_mask: TorchTensor,
                 w_q: TorchTensor, w_k: TorchTensor, w_v: TorchTensor, w_o: TorchTensor, w_norm: TorchTensor,
@@ -576,15 +821,17 @@ class LlamaModelComputation:
         residual = hidden_states.data # shape: (bsz, tgt_s, h)
         hidden_norm = self.rms_norm(hidden_states.data, norm_weight=w_norm.data, eps=config.rms_norm_eps)
         
-        # act_fn = ACT2FN[config.hidden_act]
-        gate = F.linear(hidden_norm, w_gate.data) # shape: (b, s, h, 4h)
-        up = F.linear(hidden_norm, w_up.data) # shape: (b, s, h, 4h)
-        down = F.linear(F.silu(gate) * up, w_down.data) # shape: (b, s, h, h)
+        act_fn = ACT2FN[config.hidden_act]
+        out = F.linear(act_fn(F.linear(hidden_norm, w_gate.data)) * F.linear(hidden_norm, w_up.data), w_down.data)
+        out.add_(residual)
+        # gate = F.linear(hidden_norm, w_gate.data) # shape: (b, s, h, 4h)
+        # up = F.linear(hidden_norm, w_up.data) # shape: (b, s, h, 4h)
+        # down = F.linear(F.silu(gate) * up, w_down.data) # shape: (b, s, h, h)
         
-        down.add_(residual)
+        # down.add_(residual)
         if donate[0]: hidden_states.delete()
         
-        return TorchTensor.create_from_torch(down, compute_device)
+        return TorchTensor.create_from_torch(out, compute_device)
 
     def output_embed(self, compute_device: TorchDevice, hidden_states: TorchTensor, w_lm_head: TorchTensor, donate: list, do_sample: bool, temperature: float):
         if w_lm_head.device.device_type == DeviceType.COMPRESSED:
@@ -626,7 +873,7 @@ class LlamaRMSNorm(BaseModelLayer):
         h = self.config.hidden_size
         p = Path(converted_path)
         weight_specs = [
-            ((h,), "final_norm_weight", p / self.weight_map["final_norm"][0], self.config.dtype),
+            ((h,), "final_norm_weight", p / self.weight_map["final_norm"][0], self.weight_map["final_norm"][1]),
         ]
         weights = init_weight_list(weight_specs, self.policy, self.env)
         weight_home.store(weights)
@@ -680,7 +927,7 @@ class LlamaInputEmbed(BaseModelLayer):
         p = Path(converted_path)
         
         weight_specs = [
-            ((v, h), "embed_tokens", p / self.weight_map["embed_tokens"][0], self.config.dtype),
+            ((v, h), "embed_tokens", p / self.weight_map["embed_tokens"][0], self.weight_map["embed_tokens"][1]),
         ]
         
         weights = init_weight_list(weight_specs, self.policy, self.env)
@@ -743,7 +990,7 @@ class LlamaOutputEmbed(BaseModelLayer):
         
         weight_specs = [
             # 根据用户提供的字典，使用 "lm_head" 键
-            ((v, h), "lm_head", p / self.weight_map["lm_head"][0], self.config.dtype),
+            ((v, h), "lm_head", p / self.weight_map["lm_head"][0], self.weight_map["lm_head"][1]),
         ]
         
         weights = init_weight_list(weight_specs, self.policy, self.env)
@@ -810,11 +1057,11 @@ class LlamaSelfAttention(BaseModelLayer):
         p = Path(converted_path)
         
         weight_specs = [
-            ((self.h, self.h), "atten_q_proj", p / self.weight_map["q_proj"][0], self.config.dtype),
-            ((self.kv_dim, self.h), "atten_k_proj", p / self.weight_map["k_proj"][0], self.config.dtype),
-            ((self.kv_dim, self.h), "atten_v_proj", p / self.weight_map["v_proj"][0], self.config.dtype),
-            ((self.h, self.h), "atten_o_proj", p / self.weight_map["o_proj"][0], self.config.dtype),
-            ((self.h,), "atten_norm", p / self.weight_map["norm"][0], self.config.dtype),
+            ((self.h, self.h), "atten_q_proj", p / self.weight_map["q_proj"][0], self.weight_map["q_proj"][1]),
+            ((self.kv_dim, self.h), "atten_k_proj", p / self.weight_map["k_proj"][0], self.weight_map["k_proj"][1]),
+            ((self.kv_dim, self.h), "atten_v_proj", p / self.weight_map["v_proj"][0], self.weight_map["v_proj"][1]),
+            ((self.h, self.h), "atten_o_proj", p / self.weight_map["o_proj"][0], self.weight_map["o_proj"][1]),
+            ((self.h,), "atten_norm", p / self.weight_map["norm"][0], self.weight_map["norm"][1]),
         ]
         weights = init_weight_list(weight_specs, self.policy, self.env)
         weight_home.store(weights)
@@ -896,6 +1143,10 @@ class LlamaSelfAttention(BaseModelLayer):
                         slice(0, k_home.shape[2]),                         # 对应 n_head 维度，取所有元素
                         slice(0, k_home.shape[3])                          # 对应 head_dim 维度，取所有元素
                         ) 
+            # # shape: (s, b * n_head, head_dim)
+            # indices = (slice(0, self.task.prompt_len + i),
+            #            slice(0, k_home.shape[1]))
+
 
             if self.policy.attn_sparsity >= 1.0:
                 cache_read_buf.store((
@@ -916,6 +1167,8 @@ class LlamaSelfAttention(BaseModelLayer):
                         slice(0, k_home.shape[2]),                         # 对应 n_head 维度，取所有元素
                         slice(0, k_home.shape[3])                          # 对应 head_dim 维度，取所有元素
                         ) 
+            # indices = (slice(0, self.task.prompt_len + i - 1),
+            #            slice(0, k_home.shape[1]))
             general_copy(k_buf, indices, k_home, indices)
 
             if self.policy.attn_sparsity >= 1.0:
@@ -959,6 +1212,8 @@ class LlamaSelfAttention(BaseModelLayer):
                         # slice(0, k_new.shape[2]),                         # 对应 n_head 维度，取所有元素
                         # slice(0, k_new.shape[3])                          # 对应 head_dim 维度，取所有元素
                         )     
+            # indices = (slice(0, k_new.shape[0]),
+            #            slice(0, k_new.shape[1]))
             # print(f"k_new shape {k_new.shape}, \ndata is \n{k_new.data[0, 0]}")
             # print(f"v_new shape {v_new.shape}, \ndata is \n{v_new.data[0, 0]}")     
         else:  # decoding
@@ -975,7 +1230,9 @@ class LlamaSelfAttention(BaseModelLayer):
                         slice(pos - k_new.shape[1], pos),   # 对应 s 维度，取前 k_new.shape[2] 个元素
                         # slice(None),                # 对应 n_head 维度，取所有元素
                         # slice(None)                 # 对应 head_dim 维度，取所有元素
-                        )          
+                        )       
+            # indices = (slice(pos - k_new.shape[0], pos),
+            #            slice(0, k_new.shape[1]))   
 
         general_copy(k_home, indices, k_new, None)
         general_copy(v_home, indices, v_new, None)
@@ -1043,10 +1300,10 @@ class LlamaMLP(BaseModelLayer):
         p = Path(converted_path)
 
         weight_specs = [
-            ((i, h), "mlp_gate_proj", p / self.weight_map["gate_proj"][0], self.config.dtype),
-            ((i, h), "mlp_up_proj", p / self.weight_map["up_proj"][0], self.config.dtype),
-            ((h, i), "mlp_down_proj", p / self.weight_map["down_proj"][0], self.config.dtype),
-            ((h,), "mlp_norm", p / self.weight_map["norm"][0], self.config.dtype),
+            ((i, h), "mlp_gate_proj", p / self.weight_map["gate_proj"][0], self.weight_map["gate_proj"][1]),
+            ((i, h), "mlp_up_proj", p / self.weight_map["up_proj"][0], self.weight_map["up_proj"][1]),
+            ((h, i), "mlp_down_proj", p / self.weight_map["down_proj"][0], self.weight_map["down_proj"][1]),
+            ((h,), "mlp_norm", p / self.weight_map["norm"][0], self.weight_map["norm"][1]),
         ]
         weights = init_weight_list(weight_specs, self.policy, self.env)
         weight_home.store(weights)
@@ -1200,5 +1457,5 @@ class LlamaModel(BaseModel):
     def init_all_weights(self, flexgen_weight_path):
         # self.weight_home = array_1d(self.num_layers, ValueHolder)
         for layer_id, layer in enumerate(self.layers):
-            print(f"layer id is {layer_id+1}, {layer}")
+            # print(f"layer id is {layer_id+1}, {layer}")
             layer.init_weight(self.weight_home[layer_id], flexgen_weight_path)

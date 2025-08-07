@@ -77,7 +77,9 @@ def add_parser_arguments(parser:argparse.ArgumentParser):
 
 def get_test_inputs(prompt_len, num_prompts, tokenizer):
     prompts = ["Paris is the capital city of"]
-    input_ids = tokenizer(prompts, padding="max_length",
+    # input_ids = tokenizer(prompts, padding="max_length",
+    #                       max_length=prompt_len).input_ids
+    input_ids = tokenizer(prompts, 
                           max_length=prompt_len).input_ids
     return (input_ids[0],) * num_prompts
 
