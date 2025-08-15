@@ -36,6 +36,7 @@ class FlexModelConfig:
     # Key = FlexGen内部标准名, Value = 来源框架中的原始名
     # 使用 {i} 作为层号的占位符
     layer_name_map: Dict[str, str]
+    pad_token_id: int = None
     def __init__(self, **kwargs):
             # 1. 先检查并设置所有显式定义的核心字段
             required_fields = [field.name for field in dataclasses.fields(self)]
@@ -90,7 +91,8 @@ class FlexModelConfigFactory:
                             "positional_embedding_type", "layer_name_map", 
                         }
         filtered_config = {k: v for k, v in config.items() if k not in explicit_params}
-        filtered_config['pad_token_id'] = 0
+        # 不要硬编码pad_token_id，让它从原始配置中获取
+        # filtered_config['pad_token_id'] = 0
 
         # LLaMA, DeepSeek, Qwen2 等现代模型架构高度相似
         if model_type in ["llama", "deepseek", "qwen2", "mistral"]:
@@ -102,6 +104,7 @@ class FlexModelConfigFactory:
                 num_hidden_layers=config["num_hidden_layers"],
                 ffn_embed_dim=config["intermediate_size"],
                 dtype=np.float32,
+                pad_token_id=getattr(config, "pad_token_id", None) or getattr(config, "eos_token_id", None), 
                 
                 vocab_size=config["vocab_size"],
                 num_key_value_heads=config.get("num_key_value_heads", config["num_attention_heads"]),
