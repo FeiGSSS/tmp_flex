@@ -309,7 +309,7 @@ class BaseModel:
             if self.task.stop:
                 stopped = self.stopped[left:right]
                 self.output_ids[left:right, pos:pos+1] = np.where(
-                    stopped, self.config.pad_token_id, ids)
+                    stopped, getattr(self.config, "pad_token_id", self.config.bos_token_id), ids)
                 stopped[:] = np.logical_or(stopped, ids == self.task.stop)
             else:
                 self.output_ids[left:right, pos:pos+1] = ids
@@ -351,7 +351,7 @@ class BaseModel:
             else self.env.gpu)
         val = attention_compute.allocate(
             (self.policy.gpu_batch_size, self.task.prompt_len), bool)
-        val.load_from_np((input_ids != self.config.pad_token_id))
+        val.load_from_np((input_ids != getattr(self.config, "pad_token_id", self.config.eos_token_id)))
         self.attention_mask[k].store(val)
     
     # def load_weight(self, i, j, k, overlap=True):
@@ -493,7 +493,11 @@ class BaseModel:
         for i in range(self.execute_gen_len):
             timers("generate").start()
             self.update_attention_mask(i, 0)
+            # print(f"DEBUG: Generation step {i}/{self.execute_gen_len-1}")
+
             for j in range(self.num_layers):
+                # print(f"DEBUG: Processing layer {j}/{self.num_layers-1}")
+
                 self.load_weight(i, j+1, 0)
                 self.load_cache(i, j+1, 0)
                 self.load_hidden(i, j, 0)
@@ -654,8 +658,17 @@ class BaseModel:
         self.execute_gen_len = task.cut_gen_len if task.cut_gen_len else task.gen_len
         
         # Output token ids
+        print(task.inputs, prompt_len, gen_len)
+        pad_token_id = getattr(self.config, "pad_token_id", None)
+        if pad_token_id is None:
+            pad_token_id = getattr(self.config, "bos_token_id", 0)
+        if pad_token_id is None:
+            pad_token_id = getattr(self.config, "eos_token_id", 0) 
+        if pad_token_id is None:
+            pad_token_id = 0  # 最终fallback
+        
         self.output_ids = np.full((len(task.inputs), prompt_len + gen_len),
-                                  self.config.pad_token_id,
+                                  pad_token_id,
                                   dtype=np.int32)
         self.stopped = np.zeros((len(task.inputs), 1), dtype=bool)
         self.output_ids[:, :prompt_len] = np.asarray(task.inputs)
@@ -743,8 +756,14 @@ class BaseModel:
         self.execute_gen_len = task.cut_gen_len if task.cut_gen_len else task.gen_len
 
         # Output token ids
+        pad_token_id = getattr(self.config, "pad_token_id", None)
+        if pad_token_id is None:
+            pad_token_id = getattr(self.config, "bos_token_id", 0)
+        if pad_token_id is None:
+            pad_token_id = 0  # 最终fallback
+            
         self.output_ids = np.full((len(task.inputs), prompt_len + gen_len),
-            self.config.pad_token_id, dtype=np.int32)
+            pad_token_id, dtype=np.int32)
         self.stopped = np.zeros((len(task.inputs), 1), dtype=bool)
         self.output_ids[:, :prompt_len] = np.asarray(task.inputs)
         assert gpu_batch_size * num_gpu_batches == len(task.inputs)

@@ -71,6 +71,8 @@ def add_parser_arguments(parser:argparse.ArgumentParser):
 
     parser.add_argument("--overlap", type=str2bool, nargs='?',
         const=True, default=True)
+    parser.add_argument("--force_convert", default=False, action="store_true",
+        help="Whether to force convert the model weights.")
 
 
 
@@ -118,7 +120,7 @@ def run_flexgen(args):
     assert not (args.compress_cache and args.attn_sparsity < 1.0), "Not implemented"
 
     print("init weight...")
-    model_config, converted_path, weight_map = AutoFlexModel.from_pretrained(args.path, force_convert=True)
+    model_config, converted_path, weight_map = AutoFlexModel.from_pretrained(args.path, force_convert=args.force_convert)
     model_config: FlexModelConfig
     converted_path: str
     weight_map: dict
@@ -136,6 +138,12 @@ def run_flexgen(args):
     # tokenizer = AutoTokenizer.from_pretrained(args.path)
     warmup_inputs = get_test_inputs(32, num_prompts, tokenizer)
     inputs = get_test_inputs(prompt_len, num_prompts, tokenizer)
+    print('=========================')
+    print(f"inputs: {inputs}")
+    print(f"tranformers inputs is: [ 1, 3681, 338, 278, 7483, 4272, 310]")
+    # is_equal = inputs == ([ 1, 3681, 338, 278, 7483, 4272, 310], )
+    # print(f"inputs and transformers inputs id is_equal: {is_equal}")
+    print('=========================')
 
     print("load weight...")
     model = get_model_architecture(config=model_config, path=converted_path, policy=policy, env=env, weight_map=weight_map)
@@ -152,6 +160,7 @@ def run_flexgen(args):
         output_ids = model.generate(
             inputs, max_new_tokens=args.gen_len,
             debug_mode=args.debug_mode, cut_gen_len=cut_gen_len, verbose=args.verbose)
+        print(f"output_ids: {output_ids}")
         costs = timers("generate").costs
     finally:
         env.close_copy_threads()

@@ -106,7 +106,7 @@ class ExecutionEnv:
 # 定义一个常见的仅解码器模型架构列表，用于判断
 # 这个列表可以根据需要进行扩充
 DECODER_ONLY_ARCHITECTURES = [
-    # "LlamaForCausalLM",
+    "LlamaForCausalLM",  # 添加LLaMA支持
     "GPT2LMHeadModel",
     "GPTJForCausalLM",
     "GPTNeoXForCausalLM",
@@ -183,6 +183,8 @@ def get_tokenizer(
     print(f" - 词汇表大小: {tokenizer.vocab_size}")
     print(f" - Padding Side: {tokenizer.padding_side}")
     print(f" - Pad Token: '{tokenizer.pad_token}' (ID: {tokenizer.pad_token_id})")
+    print(f" - BOS Token: '{tokenizer.bos_token}' (ID: {tokenizer.bos_token_id})")
+    print(f" - EOS Token: '{tokenizer.eos_token}' (ID: {tokenizer.eos_token_id})")
     
     return tokenizer
 
@@ -203,11 +205,16 @@ def init_weight_list(weight_specs, policy, env):
     sizes = [np.prod(spec[0]) for spec in weight_specs]
     sizes_cumsum = np.cumsum(sizes)
     ret = []
+    flag = 0
     for i in range(len(weight_specs)):
         mid_percent = (sizes_cumsum[i] - sizes[i] / 2) / sizes_cumsum[-1]
         home = get_choice(mid_percent * 100, dev_percents, dev_choices)
         shape, name, filename, dtype = weight_specs[i]
-        dtype = str_to_dtype[dtype] if isinstance(dtype, str) else dtype
+        if isinstance(dtype, str):
+            dtype, flag = str_to_dtype[dtype], 1
+        else:
+            dtype, flag = np_dtype_to_torch_dtype[dtype], 0
+        # dtype, flag= str_to_dtype[dtype], 1 if isinstance(dtype, str) else dtype
 
         if len(shape) < 2:
             pin_memory = True
@@ -218,12 +225,14 @@ def init_weight_list(weight_specs, policy, env):
 
         if not compress:
             dtype = torch_dtype_to_np_dtype[dtype]
+            # print(flag)
+            
             weight = home.allocate(shape, dtype, pin_memory=pin_memory)
 
             if DUMMY_WEIGHT not in str(filename):
                 weight.load_from_np_file(weight_specs[i][2])
             else:
-                dtype = torch_dtype_to_np_dtype[dtype]
+                dtype = torch_dtype_to_np_dtype[dtype] 
                 weight.load_from_np(np.ones(shape, dtype))
                 #weight.load_from_np(np.random.rand(*shape).astype(dtype))
         else:
