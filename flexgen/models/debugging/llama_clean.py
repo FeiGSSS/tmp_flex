@@ -12,12 +12,15 @@ from flexgen.models.utils import (ExecutionEnv, Task, Policy,
 from flexgen.models.config import FlexModelConfig
 from flexgen.pytorch_backend import (TorchDevice, TorchDisk, TorchLink, TorchNuma, TorchTensor, 
     TorchMixedDevice, DeviceType, general_copy, fix_recursive_import)
+from flexgen.timer import timers
 
 fix_recursive_import()
 
 import pickle as pkl
 import os
 from collections import defaultdict
+from tqdm import tqdm
+
 
 class DebugLogger:
     """
@@ -324,88 +327,7 @@ class LLaMAModelComputation:
         
         return TorchTensor.create_from_torch(ids, compute_device), TorchTensor.create_from_torch(logits, compute_device)
 
-    # def mha_old(self, compute_device, inputs, attention_mask, w_q, w_k, w_v, w_out, w_ln, 
-    #         n_head, n_kv_heads, freqs_cis, donate, compress_cache, comp_config):
-    #     """Multi-head attention (prefill phase) with RoPE and GQA"""
-    #     # decompress weights
-    #     if w_q.device.device_type == DeviceType.COMPRESSED:
-    #         w_q = w_q.device.decompress(w_q)
-    #         w_k = w_k.device.decompress(w_k)
-    #         w_v = w_v.device.decompress(w_v)
-    #         w_out = w_out.device.decompress(w_out)
-
-    #     b, s, h = inputs.shape
-    #     head_dim = h // n_head
-    #     scaling = head_dim ** -0.5
-        
-    #     # Pre-normalization with RMSNorm
-    #     residual = inputs.data
-    #     hidden = self.rms_norm(inputs.data, w_ln.data)
-
-    #     # Linear projections
-    #     q = F.linear(hidden, w_q.data) * scaling
-    #     k = F.linear(hidden, w_k.data)
-    #     v = F.linear(hidden, w_v.data)
-        
-    #     # Reshape for multi-head attention
-    #     q = q.view(b, s, n_head, head_dim)
-    #     k = k.view(b, s, n_kv_heads, head_dim)
-    #     v = v.view(b, s, n_kv_heads, head_dim)
-
-    #     # Apply RoPE
-    #     q, k = self.apply_rotary_emb(q, k, freqs_cis)
-
-    #     # Save for cache before repeating
-    #     k_for_cache = k
-    #     v_for_cache = v
-        
-    #     # Repeat k,v for grouped query attention
-    #     num_key_value_groups = n_head // n_kv_heads
-    #     k = self.repeat_kv(k, num_key_value_groups)
-    #     v = self.repeat_kv(v, num_key_value_groups)
-
-    #     # Transpose for attention computation
-    #     q = q.transpose(1, 2)  # (b, n_head, s, head_dim)
-    #     k = k.transpose(1, 2)  # (b, n_head, s, head_dim)
-    #     v = v.transpose(1, 2)  # (b, n_head, s, head_dim)
-
-    #     # Compute attention scores
-    #     scores = torch.matmul(q, k.transpose(2, 3))
-
-    #     # Apply attention mask (combine causal mask with attention mask)
-    #     if s > 1:
-    #         # Causal mask
-    #         causal_mask = torch.full((1, 1, s, s), float("-inf"), device=scores.device)
-    #         causal_mask = torch.triu(causal_mask, diagonal=1)
-    #         scores = scores + causal_mask
-        
-    #     # Apply attention mask if provided
-    #     if attention_mask is not None:
-    #         mask = attention_mask.data.view(b, 1, 1, s)
-    #         scores = torch.where(mask, scores, -1e4)
-        
-    #     scores = F.softmax(scores.float(), dim=-1).type_as(q)
-    #     output = torch.matmul(scores, v)
-
-    #     # Reshape and apply output projection
-    #     output = output.transpose(1, 2).contiguous().view(b, s, h)
-    #     value = F.linear(output, w_out.data) + residual
-
-    #     if donate[0]: inputs.delete()
-    #     if donate[1]: attention_mask.delete()
-
-    #     # Prepare cache tensors (s, b * n_kv_heads, head_dim)
-    #     k = k_for_cache.permute(1, 0, 2, 3).reshape(s, b * n_kv_heads, head_dim)
-    #     v = v_for_cache.permute(1, 0, 2, 3).reshape(s, b * n_kv_heads, head_dim)
-
-    #     if compress_cache:
-    #         k = compute_device.compressed_device.compress(k, comp_config)
-    #         v = compute_device.compressed_device.compress(v, comp_config)
-    #     else:
-    #         k = TorchTensor.create_from_torch(k, compute_device)
-    #         v = TorchTensor.create_from_torch(v, compute_device)
-
-    #     return TorchTensor.create_from_torch(value, compute_device), k, v
+    
     # def mha(self, compute_device, inputs, attention_mask, w_q, w_k, w_v, w_out, w_ln,
     #     n_head, n_kv_heads, freqs_cis, donate, compress_cache, comp_config):
     #     """
@@ -575,12 +497,12 @@ class LLaMAModelComputation:
             causal_mask = torch.triu(torch.full((s, s), mask_fill_value, device=attn_weights.device), diagonal=1)
             causal_mask = causal_mask.unsqueeze(0).unsqueeze(0)
             attn_weights = attn_weights + causal_mask
-        if attention_mask is not None:
-            padding_mask = (attention_mask.data == 0).view(b, 1, 1, s)
-            attn_weights = attn_weights.masked_fill(padding_mask, mask_fill_value)
-        mask_fill_value = torch.finfo(torch.float16).min
-        padding_mask = ~(attention_mask.data.bool()).view(b, 1, 1, s)
-        attn_weights = attn_weights.masked_fill(padding_mask, mask_fill_value)
+        # if attention_mask is not None:
+        #     padding_mask = (attention_mask.data == 0).view(b, 1, 1, s)
+        #     attn_weights = attn_weights.masked_fill(padding_mask, mask_fill_value)
+        # mask_fill_value = torch.finfo(torch.float16).min
+        # padding_mask = ~(attention_mask.data.bool()).view(b, 1, 1, s)
+        # attn_weights = attn_weights.masked_fill(padding_mask, mask_fill_value)
         if attention_mask is not None:
             padding_mask = ~(attention_mask.data.bool()).view(b, 1, 1, s)
             attn_weights = attn_weights.masked_fill(padding_mask, mask_fill_value)
@@ -637,17 +559,21 @@ class LLaMAModelComputation:
         src_s = attention_mask.shape[1]
         head_dim = h // n_head
 
+        # 1. 前置归一化
         residual = inputs.data
         hidden = self.rms_norm(inputs.data, w_ln.data)
 
+        # 2. QKV 线性投射
         q = F.linear(hidden, w_q.data)
         k = F.linear(hidden, w_k.data)
         v = F.linear(hidden, w_v.data)
 
+        # 3. 重塑和转置
         query_states = q.view(b, tgt_s, n_head, head_dim).transpose(1, 2)
         key_states = k.view(b, tgt_s, n_kv_heads, head_dim).transpose(1, 2)
         value_states = v.view(b, tgt_s, n_kv_heads, head_dim).transpose(1, 2)
 
+        # 4. RoPE
         cos_half = freqs_cis.real.to(query_states.dtype)
         sin_half = freqs_cis.imag.to(query_states.dtype)
         cos = torch.cat((cos_half, cos_half), dim=-1)
@@ -663,9 +589,11 @@ class LLaMAModelComputation:
         query_states = (query_states * cos) + (rotate_half(query_states) * sin)
         key_states = (key_states * cos) + (rotate_half(key_states) * sin)
         
-        # Correctly prepare k_new and v_new for the cache
-        k_new = key_states.transpose(1, 2).contiguous().view(b, tgt_s, n_kv_heads, head_dim).permute(1, 0, 2, 3).reshape(tgt_s, b * n_kv_heads, head_dim)
-        v_new = value_states.transpose(1, 2).contiguous().view(b, tgt_s, n_kv_heads, head_dim).permute(1, 0, 2, 3).reshape(tgt_s, b * n_kv_heads, head_dim)
+        # 5. 准备 k_new 和 v_new 用于 cache
+        k_new_for_cache = key_states.permute(2, 0, 1, 3).contiguous().reshape(-1, b * n_kv_heads, head_dim)
+        v_new_for_cache = value_states.permute(2, 0, 1, 3).contiguous().reshape(-1, b * n_kv_heads, head_dim)
+        # k_new = key_states.transpose(1, 2).contiguous().view(b, tgt_s, n_kv_heads, head_dim).permute(1, 0, 2, 3).reshape(tgt_s, b * n_kv_heads, head_dim)
+        # v_new = value_states.transpose(1, 2).contiguous().view(b, tgt_s, n_kv_heads, head_dim).permute(1, 0, 2, 3).reshape(tgt_s, b * n_kv_heads, head_dim)
 
         if isinstance(k_cache, TorchTensor):
             if compress_cache:
@@ -675,17 +603,18 @@ class LLaMAModelComputation:
                 k_cached = k_cache.data[:src_s-tgt_s]
                 v_cached = v_cache.data[:src_s-tgt_s]
             
-            k_all = torch.cat([k_cached, k_new], dim=0)
-            v_all = torch.cat([v_cached, v_new], dim=0)
+            k_all = torch.cat([k_cached, k_new_for_cache], dim=0) # shape: (src_s, b * n_kv_heads, head_dim)
+            v_all = torch.cat([v_cached, v_new_for_cache], dim=0)
         else:
-            k_all = k_new
-            v_all = v_new
+            k_all = k_new_for_cache # shape: (tgt_s, b * n_kv_heads, head_dim)
+            v_all = v_new_for_cache # shape: (tgt_s, b * n_kv_heads, head_dim)
         
         # 直接从 k_all 张量获取其真实的序列长度
         actual_seq_len = k_all.shape[0]
         # 使用真实长度进行 view 操作，并为保证内存连续性添加 .contiguous()
         key_states = k_all.permute(1, 0, 2).contiguous().view(b, n_kv_heads, actual_seq_len, head_dim)
         value_states = v_all.permute(1, 0, 2).contiguous().view(b, n_kv_heads, actual_seq_len, head_dim)
+        # print(key_states.shape, value_states.shape);exit()
 
         # key_states = k_all.permute(1, 0, 2).view(b, n_kv_heads, src_s, head_dim)
         # value_states = v_all.permute(1, 0, 2).view(b, n_kv_heads, src_s, head_dim)
@@ -699,18 +628,33 @@ class LLaMAModelComputation:
 
         key_states = repeat_kv_official(key_states, n_head // n_kv_heads)
         value_states = repeat_kv_official(value_states, n_head // n_kv_heads)
+        # print(query_states.shape, key_states.shape, value_states.shape);exit()
 
+
+        # 6. 注意力得分
         scaling = head_dim ** -0.5
         attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) * scaling
         
+        # 7. 应用注意力遮罩
+        mask_fill_value = torch.finfo(attn_weights.dtype).min
         if attention_mask is not None:
             # padding_mask = (attention_mask.data == 0).view(b, 1, 1, src_s)
-            padding_mask = (attention_mask.data[:, :actual_seq_len] == 0).view(b, 1, 1, actual_seq_len)
-            attn_weights = attn_weights.masked_fill(padding_mask, torch.finfo(torch.float16).min)
+            padding_mask = ~(attention_mask.data.bool()).view(b, 1, 1, actual_seq_len)
+            attn_weights = attn_weights.masked_fill(padding_mask, mask_fill_value)
+            # mask = attention_mask.data.view(b, 1, 1, actual_seq_len)
+            # additive_mask = torch.zeros_like(mask, dtype=attn_weights.dtype)
+            # additive_mask.masked_fill_(mask == 0, mask_fill_value)
+            # attn_weights = attn_weights + additive_mask
+            # padding_mask = (attention_mask.data[:, :actual_seq_len] == 0).view(b, 1, 1, actual_seq_len)
+            # attn_weights = attn_weights.masked_fill(padding_mask, torch.finfo(torch.float16).min)
 
+        # 8. Softmax
         attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+        
+        # 9. 应用于 V
         attn_output = torch.matmul(attn_weights, value_states)
 
+        # 10. 输出 reshape 和投影
         attn_output = attn_output.transpose(1, 2).contiguous()
         attn_output = attn_output.reshape(b, tgt_s, h)
         value = F.linear(attn_output, w_out.data) + residual
@@ -719,11 +663,11 @@ class LLaMAModelComputation:
         if donate[1]: attention_mask.delete()
 
         if compress_cache:
-            k_new = compute_device.compressed_device.compress(k_new, comp_config)
-            v_new = compute_device.compressed_device.compress(v_new, comp_config)
+            k_new = compute_device.compressed_device.compress(k_new_for_cache, comp_config)
+            v_new = compute_device.compressed_device.compress(v_new_for_cache, comp_config)
         else:
-            k_new = TorchTensor.create_from_torch(k_new, compute_device)
-            v_new = TorchTensor.create_from_torch(v_new, compute_device)
+            k_new = TorchTensor.create_from_torch(k_new_for_cache, compute_device)
+            v_new = TorchTensor.create_from_torch(v_new_for_cache, compute_device)
 
         return TorchTensor.create_from_torch(value, compute_device), k_new, v_new
         
@@ -949,7 +893,7 @@ class LLaMAModelComputation:
         # Pre-normalization with RMSNorm
         residual = inputs.data
         out = self.rms_norm(inputs.data, w_ln.data)
-        print_stats(out, "11a. After Post-Attention RMSNorm")
+        # print_stats(out, "11a. After Post-Attention RMSNorm")
         
         # SwiGLU: gate(x) * SiLU(up(x))
         # 检查权重是否正确加载
@@ -967,23 +911,23 @@ class LLaMAModelComputation:
             }
         
         gate = F.linear(out, w_gate.data)
-        print_stats(gate, "11a1. Gate projection output")
+        # print_stats(gate, "11a1. Gate projection output")
         
         up = F.linear(out, w_up.data)
-        print_stats(up, "11a2. Up projection output")
+        # print_stats(up, "11a2. Up projection output")
         
         silu_gate = F.silu(gate)  # SiLU activation
-        print_stats(silu_gate, "11a3. After SiLU activation")
+        # print_stats(silu_gate, "11a3. After SiLU activation")
         
         intermediate = silu_gate * up  # Element-wise multiplication
-        print_stats(intermediate, "11a4. SiLu(Gate) * up intermediate")
+        # print_stats(intermediate, "11a4. SiLu(Gate) * up intermediate")
         
         # Down projection
         out = F.linear(intermediate, w_down.data)
-        print_stats(out, "11a5. After down projection (before residual)")
+        # print_stats(out, "11a5. After down projection (before residual)")
         
         out = out + residual  # Residual connection
-        print_stats(out, "11b. After MLP (with residual)")
+        # print_stats(out, "11b. After MLP (with residual)")
 
         if donate[0]: inputs.delete()
         return TorchTensor.create_from_torch(out, compute_device)
@@ -1044,20 +988,22 @@ class LLaMAInputEmbed(BaseModelLayer):
             (w_token, donate[1]), = weight_read_buf.pop()
         else:
             (w_token, _), = weight_read_buf.val
-
+        # print(f"pad_token_id: {getattr(self.config, 'pad_token_id', None)}")
+        # print(f"h is {h.data}")
+        # exit()
         h = self.computation.input_embed(self.compute_device, h,
             w_token, getattr(self.config, "pad_token_id", self.config.bos_token_id), donate)
         hidden.val = h
-        if i == 0: # 输入嵌入只在prefill阶段运行和记录
-            # 打印输入嵌入的统计信息，格式与test_final_verify_and_trace.py一致
-            print_stats(h.data, "0. Initial Input Embeddings")
+        # if i == 0: # 输入嵌入只在prefill阶段运行和记录
+        #     # 打印输入嵌入的统计信息，格式与test_final_verify_and_trace.py一致
+        #     print_stats(h.data, "0. Initial Input Embeddings")
             
-            FLEXGEN_DEBUG_LOGGER.record(
-                tensor_data=h.data,
-                gen_token_step=i,
-                layer_id=0,
-                layer_name="input_embed"
-            )
+        #     FLEXGEN_DEBUG_LOGGER.record(
+        #         tensor_data=h.data,
+        #         gen_token_step=i,
+        #         layer_id=0,
+        #         layer_name="input_embed"
+        #     )
 
 
 class LLaMAOutputEmbed(BaseModelLayer):
@@ -1124,6 +1070,7 @@ class LLaMAOutputEmbed(BaseModelLayer):
             hidden.val = [h, logits]
         else:
             hidden.val = h
+        # print_stats(hidden.val.data, f"Layer Output embedding")
 
 
 class LLaMASelfAttention(BaseModelLayer):
@@ -1341,34 +1288,34 @@ class LLaMASelfAttention(BaseModelLayer):
         else:  # decoding
             mask, donate[1] = attention_mask.val.smart_copy(self.attention_compute)
             (k_cache, donate[7]), (v_cache, donate[8]) = cache_read_buf.pop()
-            correct_cache_len = self.task.prompt_len + i - 1
-            if k_cache.data.shape[0] != correct_cache_len:
-                # 手动将从底层框架得到的错误尺寸张量，裁剪为正确的尺寸
-                k_cache.data = k_cache.data[:correct_cache_len]
-                v_cache.data = v_cache.data[:correct_cache_len]
+            # correct_cache_len = self.task.prompt_len + i - 1
+            # if k_cache.data.shape[0] != correct_cache_len:
+            #     # 手动将从底层框架得到的错误尺寸张量，裁剪为正确的尺寸
+            #     k_cache.data = k_cache.data[:correct_cache_len]
+            #     v_cache.data = v_cache.data[:correct_cache_len]
             # if i == 1: # 只在生成第一个新token时记录，避免日志过多
             #     print("-" * 25, f" 调试信息: Layer {self.layer_id}, Step {i} ", "-" * 25)
             #     print(f"i: {i}, k_cache: {k_cache.shape}, v_cache: {v_cache.shape}, prompt_len: {self.task.prompt_len}")
                 
-            #     # 检查 K-Cache
-            #     k_data = k_cache.data
-            #     # 沿着 head 和 head_dim 维度计算每行的绝对值之和
-            #     # 如果一整行都是0，那么它的和也为0
-            #     k_row_sums = torch.abs(k_data).sum(dim=(1, 2))
-            #     # 计算和不为0的行的数量
-            #     k_nonzero_rows = torch.count_nonzero(k_row_sums).item()
-                
-            #     print(f"K-Cache 总形状: {k_data.shape}")
-            #     print(f"检测到 {k_nonzero_rows} / {k_data.shape[0]} 行包含非零数据。")
+            # # 检查 K-Cache
+            # k_data = k_cache.data
+            # # 沿着 head 和 head_dim 维度计算每行的绝对值之和
+            # # 如果一整行都是0，那么它的和也为0
+            # k_row_sums = torch.abs(k_data).sum(dim=(1, 2))
+            # # 计算和不为0的行的数量
+            # k_nonzero_rows = torch.count_nonzero(k_row_sums).item()
+            
+            # print(f"K-Cache 总形状: {k_data.shape}")
+            # print(f"检测到 {k_nonzero_rows} / {k_data.shape[0]} 行包含非零数据。")
 
-            #     # 检查 V-Cache (同理)
-            #     v_data = v_cache.data
-            #     v_row_sums = torch.abs(v_data).sum(dim=(1, 2))
-            #     v_nonzero_rows = torch.count_nonzero(v_row_sums).item()
+            # # 检查 V-Cache (同理)
+            # v_data = v_cache.data
+            # v_row_sums = torch.abs(v_data).sum(dim=(1, 2))
+            # v_nonzero_rows = torch.count_nonzero(v_row_sums).item()
 
-            #     print(f"V-Cache 总形状: {v_data.shape}")
-            #     print(f"检测到 {v_nonzero_rows} / {v_data.shape[0]} 行包含非零数据。")
-            #     print("-" * 80)
+            # print(f"V-Cache 总形状: {v_data.shape}")
+            # print(f"检测到 {v_nonzero_rows} / {v_data.shape[0]} 行包含非零数据。")
+            # print("-" * 80);exit()
 
             #     FLEXGEN_DEBUG_LOGGER.record(
             #         tensor_data=k_cache.data,
@@ -1522,26 +1469,26 @@ class LLaMATransformerLayer(BaseTransformerLayer):
         else:
             read_buf1, read_buf2 = weight_read_buf.val
 
-        # 只在prefill阶段(i==0)且是第一层或第二层时打印详细信息
-        if i == 0 and self.layer_id in [0, 1]:
-            print(f"\n\n{'='*80}\n--- TRACING LAYER {self.layer_id} --- \n{'='*80}\n")
+        # # 只在prefill阶段(i==0)且是第一层或第二层时打印详细信息
+        # if i == 0 and self.layer_id in [0, 1]:
+        #     print(f"\n\n{'='*80}\n--- TRACING LAYER {self.layer_id} --- \n{'='*80}\n")
             
-            # 记录输入状态
-            print_stats(hidden.val.data, f"Layer {self.layer_id} - 0. Initial Hidden State for Layer {self.layer_id}")
+        #     # 记录输入状态
+        # print_stats(hidden.val.data, f"Layer {self.layer_id} - 0. Initial Hidden State for Layer {self.layer_id}")
 
         self.attention.forward(hidden, cache_read_buf, read_buf1, attention_mask,
                                cache_write_buf, i, k)
-        if i == 0: # 只在prefill阶段检查
-            FLEXGEN_DEBUG_LOGGER.record(
-                tensor_data=hidden.val.data,
-                gen_token_step=i,
-                layer_id=self.layer_id + 1,
-                layer_name="attention_output_only" # 使用一个独特的层名
-            )
+        # if i == 0: # 只在prefill阶段检查
+        #     FLEXGEN_DEBUG_LOGGER.record(
+        #         tensor_data=hidden.val.data,
+        #         gen_token_step=i,
+        #         layer_id=self.layer_id + 1,
+        #         layer_name="attention_output_only" # 使用一个独特的层名
+        #     )
             
-            # 只在第一层或第二层时打印attention输出
-            if self.layer_id in [0, 1]:
-                print_stats(hidden.val.data, f"Layer {self.layer_id} - 10. Output after Attention Block")
+        #     # 只在第一层或第二层时打印attention输出
+        #     # if self.layer_id in [0, 1]:
+        # print_stats(hidden.val.data, f"Layer {self.layer_id} - 10. Output after Attention Block")
         
         self.mlp.forward(hidden, None, read_buf2, attention_mask, None, i, k)
 
@@ -1553,8 +1500,8 @@ class LLaMATransformerLayer(BaseTransformerLayer):
         )
         
         # 只在第一层或第二层时打印最终输出
-        if i == 0 and self.layer_id in [0, 1]:
-            print_stats(hidden.val.data, f"Layer {self.layer_id} - 11c. Final Output of Layer {self.layer_id}")
+        # if i == 0 and self.layer_id in [0, 1]:
+        # print_stats(hidden.val.data, f"Layer {self.layer_id} - 11c. Final Output of Layer {self.layer_id}")
         # if self.layer_id == 1:
         #     exit()
 
@@ -1729,67 +1676,32 @@ class LLaMAModel(BaseModel):
         print("All results have been saved to disk.")
         return self.output_ids
     
+    def generation_loop_overlap_single_batch(self):
+        # Prologue
+        for k in range(self.num_gpu_batches):
+            self.load_weight(0, 0, k)
+        self.sync()
+
+        # Generate
+        # print(f"\n开始生成，最大新token数量: {self.execute_gen_len}")
+        for i in range(self.execute_gen_len):
+            # print(f"\n=== 生成第 {i+1} 个token ===")
+            timers("generate").start()
+            self.update_attention_mask(i, 0)
+            # print(f"DEBUG: Generation step {i}/{self.execute_gen_len-1}")
+
+            for j in range(self.num_layers):
+                # print(f"DEBUG: Processing layer {j}/{self.num_layers-1}")
+
+                self.load_weight(i, j+1, 0)
+                self.load_cache(i, j+1, 0)
+                self.load_hidden(i, j, 0)
+                self.compute_layer(i, j, 0)
+                self.store_cache(i, j-1, 0)
+                self.store_hidden(i, j, 0)
+                self.sync()
+            timers("generate").stop()
+
+            if self.task.stop and np.all(self.stopped):
+                break
     
-    # def save_debug_data(self, filename_prefix="flexgen_debug"):
-    #     """保存调试数据到文件"""
-    #     import os
-    #     import json
-    #     import pickle
-        
-    #     # 创建debug_results目录
-    #     os.makedirs('debug_results', exist_ok=True)
-        
-    #     # 保存统计信息到JSON
-    #     stats_only = {}
-    #     if 'input_hidden_state' in self.debug_data:
-    #         stats_only['input_hidden_state'] = {
-    #             'shape': self.debug_data['input_hidden_state']['shape'],
-    #             'range': self.debug_data['input_hidden_state']['range'],
-    #             'mean': self.debug_data['input_hidden_state']['mean'],
-    #             'std': self.debug_data['input_hidden_state']['std']
-    #         }
-        
-    #     if 'normalized_hidden_state' in self.debug_data:
-    #         stats_only['normalized_hidden_state'] = {
-    #             'range': self.debug_data['normalized_hidden_state']['range'],
-    #             'mean': self.debug_data['normalized_hidden_state']['mean'],
-    #             'std': self.debug_data['normalized_hidden_state']['std']
-    #         }
-        
-    #     if 'logits' in self.debug_data:
-    #         stats_only['logits'] = {
-    #             'shape': self.debug_data['logits']['shape'],
-    #             'range': self.debug_data['logits']['range'],
-    #             'mean': self.debug_data['logits']['mean'],
-    #             'std': self.debug_data['logits']['std'],
-    #             'last_token_logits': {
-    #                 'shape': self.debug_data['logits']['last_token_logits']['shape'],
-    #                 'range': self.debug_data['logits']['last_token_logits']['range'],
-    #                 'mean': self.debug_data['logits']['last_token_logits']['mean'],
-    #                 'std': self.debug_data['logits']['last_token_logits']['std']
-    #             }
-    #         }
-        
-    #     if 'top_k' in self.debug_data:
-    #         stats_only['top_k'] = {
-    #             'logits': self.debug_data['top_k']['logits'].tolist(),
-    #             'indices': self.debug_data['top_k']['indices'].tolist()
-    #         }
-        
-    #     # 保存统计信息
-    #     stats_filename = f'debug_results/{filename_prefix}_stats.json'
-    #     with open(stats_filename, 'w') as f:
-    #         json.dump(stats_only, f, indent=2)
-        
-    #     # 保存完整张量数据
-    #     tensors_filename = f'debug_results/{filename_prefix}_tensors.pkl'
-    #     with open(tensors_filename, 'wb') as f:
-    #         pickle.dump(self.debug_data, f)
-        
-    #     print(f"FlexGen调试数据已保存:")
-    #     print(f"  统计信息: {stats_filename}")
-    #     print(f"  完整张量: {tensors_filename}")
-    #     print(f"  JSON文件大小: {os.path.getsize(stats_filename) / 1024:.2f} KB")
-    #     print(f"  Pickle文件大小: {os.path.getsize(tensors_filename) / (1024*1024):.2f} MB")
-        
-    #     return stats_filename, tensors_filename

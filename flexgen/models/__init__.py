@@ -2,8 +2,7 @@
 # from .llama import LLaMAInputEmbed, LLaMATransformerLayer
 from . import (
     opt, 
-    # llama,
-    llama_clean,
+    llama,
 )
 from flexgen.models.config import FlexModelConfig
 from flexgen.models.utils import Policy, ExecutionEnv
@@ -32,8 +31,8 @@ def get_model_architecture(config:FlexModelConfig,
             env=env,
             weight_map=weight_map
         ) 
-    elif model_type in ["llama", "mistral"]:   
-        return llama_clean.LLaMAModel(
+    elif model_type in ["llama"]:   
+        return llama.LLaMAModel(
             config=config,
             path=path,
             policy=policy,

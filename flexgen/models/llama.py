@@ -22,55 +22,75 @@ fix_recursive_import()
 
 class LlamaModelComputation:
     """
-    此类封装了所有为 Llama 模型定义的计算逻辑。
-    代码逻辑主要从 pytorch_backend_llama.py 迁移而来。
+    此类封装了所有原先在 pytorch_backend.py 中为 Llama 模型定义的计算逻辑。
     """
-    def rms_norm(self, x: torch.Tensor, norm_weight: torch.Tensor, eps: float = 1e-6):
-        
+    
+    def rms_norm(self, x: torch.Tensor, norm_weight: torch.Tensor, eps: float = 1e-5):
+        """RMS Normalization - LLaMA使用RMSNorm而不是LayerNorm"""
         def _norm(x, eps):
-            return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps)
-        output = _norm(x.float(), eps).type_as(x)
-        return (output * norm_weight)
+            variance = x.pow(2).mean(-1, keepdim=True)
+            # 移除 clamp 操作
+            rsqrt_var = torch.rsqrt(variance + eps)
+            return x * rsqrt_var
+            
+        output = _norm(x.float(), eps)
+        result = output * norm_weight.float()
+        return result.type_as(x)
 
     def precompute_freqs_cis(self, dim: int, end: int, theta: float = 10000.0):
-        #     """
-        # Precompute the frequency tensor for complex exponentials (cis) with given dimensions.
-
-        # This function calculates a frequency tensor with complex exponentials using the given dimension 'dim'
-        # and the end index 'end'. The 'theta' parameter scales the frequencies.
-        # The returned tensor contains complex values in complex64 data type.
-
-        # Args:
-        #     dim (int): Dimension of the frequency tensor.
-        #     end (int): End index for precomputing frequencies.
-        #     theta (float, optional): Scaling factor for frequency computation. Defaults to 10000.0.
-
-        # Returns:
-        #     torch.Tensor: Precomputed frequency tensor with complex exponentials.
-        # """
+        """预计算RoPE的频率张量"""
         freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
-        t = torch.arange(end, device=freqs.device)  # type: ignore
-        freqs = torch.outer(t, freqs).float()  # type: ignore
-        freqs_cis = torch.polar(torch.ones_like(freqs), freqs)  # complex64
+        t = torch.arange(end, device=freqs.device)
+        freqs = torch.outer(t, freqs).float()
+        freqs_cis = torch.polar(torch.ones_like(freqs), freqs)
         return freqs_cis
 
     def reshape_for_broadcast(self, freqs_cis: torch.Tensor, x: torch.Tensor):
+        """为RoPE重塑频率张量"""
         ndim = x.ndim
-        assert 0 <= 1 < ndim
         assert freqs_cis.shape == (x.shape[1], x.shape[-1])
         shape = [d if i == 1 or i == ndim - 1 else 1 for i, d in enumerate(x.shape)]
         return freqs_cis.view(*shape)
 
-    def apply_rotary_emb(self, xq: torch.Tensor, xk: torch.Tensor, freqs_cis: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
-        xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
-        freqs_cis = self.reshape_for_broadcast(freqs_cis, xq_)
-        xq_out = torch.view_as_real(xq_ * freqs_cis).flatten(3)
-        xk_out = torch.view_as_real(xk_ * freqs_cis).flatten(3)
-        return xq_out.type_as(xq), xk_out.type_as(xk)
-    
+    def apply_rotary_emb(self, xq: torch.Tensor, xk: torch.Tensor, freqs_cis: torch.Tensor):
+        """
+        应用旋转位置编码(RoPE) - 采用与Hugging Face transformers库更接近的实现方式。
+        这种方式不直接使用torch.complex，而是通过手动旋转一半的维度来实现，
+        这可能具有更好的数值稳定性。
+        """
+        def rotate_half(x):
+            """旋转输入张量的一半隐藏维度。"""
+            # 将最后一个维度切成两半
+            x1 = x[..., : x.shape[-1] // 2]
+            x2 = x[..., x.shape[-1] // 2 :]
+            # 将后半部分取反，然后与前半部分拼接
+            return torch.cat((-x2, x1), dim=-1)
+
+        # 从复数形式的 freqs_cis 中提取 cos 和 sin
+        # freqs_cis 的形状是 [seq_len, head_dim // 2]
+        # 我们需要将其 reshape 以便和 xq, xk 进行广播
+        cos = freqs_cis.real.to(xq.dtype)
+        sin = freqs_cis.imag.to(xq.dtype)
+        
+        # unsqueeze(0) for batch dim, unsqueeze(2) for n_head dim
+        # 最终形状变为 [1, seq_len, 1, head_dim // 2] 以匹配 (b, s, h, d)
+        # 但是 LLaMA 的 RoPE 是在 head_dim 级别操作的，所以需要重复
+        cos = cos.unsqueeze(0).unsqueeze(2)
+        sin = sin.unsqueeze(0).unsqueeze(2)
+        
+        # 广播 cos 和 sin 到完整的 head_dim
+        # [1, s, 1, d/2] -> [1, s, 1, d]
+        cos = cos.repeat(1, 1, 1, 2)
+        sin = sin.repeat(1, 1, 1, 2)
+
+        # 应用旋转编码
+        xq_out = (xq * cos) + (rotate_half(xq) * sin)
+        xk_out = (xk * cos) + (rotate_half(xk) * sin)
+        
+        return xq_out, xk_out
+
     def repeat_kv(self, x: torch.Tensor, n_rep: int) -> torch.Tensor:
-        """torch.repeat_interleave(x, dim=2, repeats=n_rep)"""
+        """为Grouped Query Attention重复key和value"""
         bs, slen, n_kv_heads, head_dim = x.shape
         if n_rep == 1:
             return x
@@ -79,776 +99,358 @@ class LlamaModelComputation:
             .expand(bs, slen, n_kv_heads, n_rep, head_dim)
             .reshape(bs, slen, n_kv_heads * n_rep, head_dim)
         )
-    def _attention_weights(self, q, k):
-        #  """
-            # Compute attention weights using torch.matmul, no reshape needed.
-            # Args:
-            #     q: (b, n_head, 1, head_dim)
-            #     k: (b, n_head, src_s, head_dim)
-            #     mask: (b, 1, 1, src_s) or (b, 1, src_s) -> will be broadcasted
-            # Returns:
-            #     attn_weights: (b, n_head, 1, src_s)
-            # """
-        # QK^T: (b, n_head, 1, head_dim) @ (b, n_head, src_s, head_dim)^T
-        # We need to transpose k: -> (b, n_head, head_dim, src_s)
-        k_t = k.transpose(-2, -1)  # (b, n_head, head_dim, src_s)
-        
-        # Matmul: (b, n_head, 1, head_dim) @ (b, n_head, head_dim, src_s) -> (b, n_head, 1, src_s)
-        attn_weights = torch.matmul(q, k_t)  # (b, n_head, 1, src_s)
 
-        # # Scale by sqrt(d_k)
-        # head_dim = q.size(-1)
-        # attn_weights = attn_weights / (head_dim ** 0.5)
-
-        # # Expand mask if needed
-        # if mask.dim() == 3:  # (b, 1, src_s)
-        #     mask = mask.unsqueeze(1)  # (b, 1, 1, src_s)
-
-        # Apply mask
-        # attn_weights = torch.where(mask, attn_weights, torch.tensor(-1e4, dtype=attn_weights.dtype, device=attn_weights.device))
-
-        # Softmax over last dimension (src_s)
-        attn_weights = F.softmax(attn_weights, dim=-1)
-
-        return attn_weights  # (b, n_head, 1, src_s)
-
-    def _attention_value(self, attn_weights, v):
-        # """
-        # Compute attention output: attn_weights @ V
-        # Args:
-        #     attn_weights: (b, n_head, 1, src_s)
-        #     v: (b, n_head, src_s, head_dim)
-        # Returns:
-        #     output: (b, n_head, 1, head_dim)
-        # """
-
-        # attn_weights @ V: (b, n_head, 1, src_s) @ (b, n_head, src_s, head_dim) -> (b, n_head, 1, head_dim)
-        attn_output = torch.matmul(attn_weights, v)  # (b, n_head, 1, head_dim)
-
-        return attn_output
-    
-    def _sparse_attention_value(self, compute_device, q, k_cache, v_new, v_cache, 
-                           mask, bsz, src_s, tgt_s, n_head, head_dim, attn_sparsity):
-        # """
-        # Sparse attention using general_copy, keep (b, n_head, s, head_dim) structure.
-        
-        # Args:
-        #     q: (b, n_head, 1, head_dim)
-        #     k_cache: TorchTensor (b, n_head, src_s, head_dim) - cached keys
-        #     v_new: (b, n_head, 1, head_dim)
-        #     v_cache: TorchTensor (b, n_head, src_s, head_dim) - cached values
-        #     mask: (b, 1, src_s)
-        #     attn_sparsity: float
-        
-        # Returns:
-        #     output: (b, n_head, 1, head_dim)
-        # """
-        device = q.device
-
-        # Step 1: 计算完整注意力权重
-        # k_cache: (b, n_head, src_s, head_dim)
-        # 但注意：当前 token 的 k 还没更新，所以先用缓存的
-        attn_weights_full = self._attention_weights(q, k_cache, mask)  # (b, n_head, 1, src_s)
-
-        # Step 2: 分离历史和当前
-        # attn_weights: (b, n_head, 1, src_s)
-        # 历史部分: 前 src_s-1 个
-        attn_weights_hist = attn_weights_full[..., :-1]  # (b, n_head, 1, src_s - 1)
-        attn_weight_curr = attn_weights_full[..., -1:]   # (b, n_head, 1, 1)
-
-        # 计算 topk
-        topk = max(1, int(attn_sparsity * (src_s - 1)))
-
-        # 获取 topk indices: (b, n_head, 1, topk)
-        topk_weights, topk_indices = torch.topk(attn_weights_hist, k=topk, dim=-1, sorted=False)
-        # topk_indices: (b, n_head, 1, topk) -> reshape for general_copy: (topk, b * n_head)
-        topk_indices_flat = topk_indices.squeeze(2).permute(2, 0, 1)  # (topk, b, n_head)
-        topk_indices_flat = topk_indices_flat.reshape(topk, bsz * n_head).transpose(0, 1)  # (b * n_head, topk)
-
-        # Step 3: 使用 general_copy 从 v_cache 中拷贝 topk values
-        # v_cache: (b, n_head, src_s, head_dim) -> reshape to (src_s, b * n_head, head_dim)
-        v_cache_3d = v_cache.permute(2, 0, 1, 3).reshape(src_s, bsz * n_head, head_dim)
-
-        # 分配 buffer: (topk, b * n_head, head_dim)
-        v_buf = compute_device.allocate((topk, bsz * n_head, head_dim), dtype=np.float16)
-        topk_indices_cpu = topk_indices_flat.cpu()
-
-        # 拷贝: v_buf[i, :, :] = v_cache_3d[topk_indices_cpu[i], range(b*n_head), :]
-        indices_src = topk_indices_cpu  # (b * n_head, topk)
-        indices_tgt = (slice(0, topk), slice(0, bsz * n_head))
-        general_copy(v_buf, indices_tgt, v_cache_3d, indices_src)
-        compute_device.synchronize()
-
-        # Step 4: 构造稀疏 v: [topk historical v] + [current v_new]
-        # v_buf: (topk, b * n_head, head_dim) -> (b * n_head, topk, head_dim)
-        v_sparse = v_buf.data.transpose(0, 1).reshape(bsz, n_head, topk, head_dim)  # (b, n_head, topk, head_dim)
-
-        # 拼接当前 v_new: (b, n_head, 1, head_dim)
-        v_sparse = torch.cat([v_sparse, v_new], dim=-2)  # (b, n_head, topk+1, head_dim)
-
-        # Step 5: 构造稀疏 attention weights
-        attn_weights_sparse = torch.cat([topk_weights, attn_weight_curr], dim=-1)  # (b, n_head, 1, topk+1)
-
-        # Step 6: 计算输出
-        output = torch.matmul(attn_weights_sparse, v_sparse)  # (b, n_head, 1, head_dim)
-
-        return output
-
-    def _mixed_device_attention(self, compute_device, q, k_cache, v_cache, 
-                        k_new, v_new, mask, bsz, src_s, tgt_s, n_head, head_dim):
-        # """
-        # Mixed device attention: GPU and CPU parts.
-        
-        # k_cache: (k_gpu, k_cpu), each (b_part, n_head, src_s, head_dim)
-        # """
-        k_gpu, k_cpu = k_cache
-        v_gpu, v_cpu = v_cache
-
-        b_gpu = k_gpu.shape[0]
-        b_cpu = bsz - b_gpu
-
-        q_gpu = q[:b_gpu]
-        q_cpu = q[b_gpu:].float().cpu()
-
-        k_new_gpu = k_new[:b_gpu]
-        k_new_cpu = k_new[b_gpu:].float().cpu()
-
-        v_new_gpu = v_new[:b_gpu]
-        v_new_cpu = v_new[b_gpu:].float().cpu()
-
-        mask_gpu = mask[:b_gpu]
-        mask_cpu = mask[b_gpu:]
-
-        # --- GPU Part ---
-        k_gpu_updated = k_gpu.clone()
-        k_gpu_updated[:, :, src_s-1:src_s] = k_new_gpu
-        v_gpu_updated = v_gpu.clone()
-        v_gpu_updated[:, :, src_s-1:src_s] = v_new_gpu
-
-        attn_weights_gpu = self._attention_weights(q_gpu, k_gpu_updated, mask_gpu)
-        value_gpu = self._attention_value(attn_weights_gpu, v_gpu_updated)
-
-        # --- CPU Part ---
-        k_cpu_updated = k_cpu.clone()
-        k_cpu_updated[:, :, src_s-1:src_s] = k_new_cpu
-        v_cpu_updated = v_cpu.clone()
-        v_cpu_updated[:, :, src_s-1:src_s] = v_new_cpu
-
-        attn_weights_cpu = self._attention_weights(q_cpu, k_cpu_updated, mask_cpu)
-        value_cpu = self._attention_value(attn_weights_cpu, v_cpu_updated)
-
-        # Move back
-        value_cpu = value_cpu.cuda().half()
-
-        # Concat on batch dim
-        value = torch.cat([value_gpu, value_cpu], dim=0)  # (bsz, n_head, 1, head_dim)
-
-        return value
-    
-    
-    
-    
-    # def _attention_weights(self, q, k, mask, b, src_s, n_head):
-    #     # shape: (b * n_head, 1, s)
-    #     attn_weights = torch.bmm(q, k)
-    #     # shape: (b, 1, 1, s)
-    #     mask = mask.view(b, 1, 1, src_s)
-    #     # shape: (b * n_head, 1, s)
-    #     attn_weights = attn_weights.view(b, n_head, 1, src_s)
-    #     attn_weights = torch.where(mask, attn_weights, -1e4)
-    #     attn_weights = attn_weights.view(b * n_head, 1, src_s)
-    #     attn_weights = F.softmax(attn_weights, dim=2)
-    #     return attn_weights
-    
-    # def _attention_value(self, q, k, v, mask, b, src_s, tgt_s, n_head, head_dim):
-    #     # shape: (b * n_head, 1, s)
-    #     attn_weights = self._attention_weights(q, k, mask, b, src_s, n_head)
-    #     # shape: (b, n_head, 1, head_dim)
-    #     return torch.bmm(attn_weights, v).view(b, n_head, tgt_s, head_dim)
-
-    # def _sparse_attention_value(self, q, k, v_new, v_cache, mask, b,
-    #                             src_s, tgt_s, n_head, head_dim, attn_sparsity):
-    #     # shape: (b * n_head, 1, s)
-    #     attn_weights = self._attention_weights(q, k, mask, b, src_s, n_head)
-    #     topk = int(attn_sparsity * (attn_weights.shape[2] - 1))
-    #     topk_weights, topk_indices = attn_weights[:, :, :-1].topk(
-    #         topk, dim=2, sorted=False)
-    #     topk_indices = topk_indices.view(b * n_head, topk).transpose(0, 1)
-    #     # shape: (b * n_head, 1, topk+1)
-    #     attn_weights = torch.cat([topk_weights,
-    #         attn_weights[:, :, -1].unsqueeze(-1)], dim=-1)
-
-    #     if k.is_cuda:
-    #         v_home = v_cache
-    #         v_buf = self.allocate((topk+1, b*n_head, head_dim), np.float16)
-    #         topk_indices = topk_indices.cpu()
-    #     else:
-    #         (v_home, v_buf) = v_cache
-
-    #     # shape: (s, b * n_head, head_dim)
-    #     indices_src = topk_indices
-    #     indices_tgt = (slice(0, indices_src.shape[0]), slice(0, v_home.shape[1]))
-    #     general_copy(v_buf, indices_tgt, v_home, indices_src)
-    #     v_home.device.synchronize()
-
-    #     # shape: (topk+1, b * n_head, head_dim)
-    #     v = v_buf.data[:topk+1]
-    #     v[topk:topk+1] = v_new
-    #     # shape: (b * n_head, topk+1, head_dim)
-    #     v = v.permute(1, 0, 2).reshape(b * n_head, topk+1, head_dim)
-
-    #     # shape: (b * n_head, 1, head_dim)
-    #     return torch.bmm(attn_weights, v).view(b, n_head, tgt_s, head_dim)
-
-    # def _mixed_device_attention(self, q, k_cache, v_cache, k_new, v_new,
-    #         mask, b, src_s, tgt_s, n_head, head_dim):
-    #     # The caches are stored on both gpu and cpu.
-    #     # Compute attention on gpu for caches stored on gpu.
-    #     # Compute attention on cpu for caches stored on cpu.
-    #     k_gpu, k_cpu = k_cache[0].data, k_cache[1].data
-    #     v_gpu, v_cpu = v_cache[0].data, v_cache[1].data
-    #     seg = k_gpu.shape[1]
-
-    #     # Compute GPU part
-    #     b_gpu = seg // n_head
-    #     q_gpu = q[:seg]
-    #     # shape: (s, b * n_head, head_dim)
-    #     k_gpu = k_gpu[:src_s, :seg, :]
-    #     v_gpu = v_gpu[:src_s, :seg, :]
-    #     k_gpu[src_s-1:src_s, :, :] = k_new[:, :seg, :]
-    #     v_gpu[src_s-1:src_s, :, :] = v_new[:, :seg, :]
-    #     # shape: (b * n_head, head_dim, s)
-    #     k_gpu = k_gpu.permute(1, 2, 0)
-    #     # shape: (b * n_head, s, head_dim)
-    #     v_gpu = v_gpu.permute(1, 0, 2)
-
-    #     mask_gpu = mask[:b_gpu].cuda()
-    #     value_gpu = self._attention_value(q_gpu, k_gpu, v_gpu, mask_gpu,
-    #         b_gpu, src_s, tgt_s, n_head, head_dim)
-
-    #     # Compute CPU Part
-    #     b_cpu = b - b_gpu
-    #     q_cpu = q[seg:].float().cpu()
-    #     # shape: (s, b * n_head, head_dim)
-    #     k_cpu = k_cpu[:src_s, seg:, :]
-    #     v_cpu = v_cpu[:src_s, seg:, :]
-    #     k_cpu[src_s-1:src_s, :, :] = k_new[:, seg:, :]
-    #     v_cpu[src_s-1:src_s, :, :] = v_new[:, seg:, :]
-    #     # shape: (b * n_head, head_dim, s)
-    #     k_cpu = k_cpu.permute(1, 2, 0)
-    #     # shape: (b * n_head, s, head_dim)
-    #     v_cpu = v_cpu.permute(1, 0, 2)
-
-    #     mask_cpu = mask[b_gpu:]
-    #     value_cpu = self._attention_value(q_cpu, k_cpu, v_cpu, mask_cpu,
-    #         b_cpu, src_s, tgt_s, n_head, head_dim)
-
-    #     value = torch.cat([value_gpu, value_cpu.cuda().half()], dim=0)
-    #     return value
-    
-    def input_embed(self, compute_device: TorchDevice, inputs: TorchTensor, w_token: TorchTensor, pad_token_id: int, donate: list):
+    def input_embed(self, compute_device, inputs, w_token, pad_token_id, donate):
+        """输入嵌入层 - LLaMA只有token embedding，没有position embedding"""
         if w_token.device.device_type == DeviceType.COMPRESSED:
             w_token = w_token.device.decompress(w_token)
 
         token_ids = inputs.data
         if donate[0]: inputs.delete()
-        
+        # print(f"DEBUG: token_ids shape and dtype: {token_ids.shape}, {token_ids.dtype}")
+        # token embedding
         token_embed = F.embedding(token_ids, w_token.data, pad_token_id)
-        return TorchTensor.create_from_torch(token_embed, compute_device)
-    
-    
-    # SelfAttention Prefill
-    def mha(self, compute_device: TorchDevice, 
-            hidden_states: TorchTensor, attention_mask: TorchTensor,
-            w_q: TorchTensor, w_k: TorchTensor, w_v: TorchTensor, w_o: TorchTensor, w_norm: TorchTensor,
-            n_head: int, config: FlexModelConfig, donate: list, compress_cache: bool, comp_config: any, ):
-        
-        if w_q.device.device_type == DeviceType.COMPRESSED:
-            w_q, w_k, w_v, w_o, w_norm = [x.device.decompress(x) for x in [w_q, w_k, w_v, w_o, w_norm]]
-
-      
-        bsz, seq_len, h = hidden_states.shape
-        n_q_head = n_head
-        n_kv_head = getattr(config, 'num_key_value_heads', n_q_head)
-        num_key_value_groups = n_q_head // n_kv_head
-        head_dim = h // n_q_head
-        scaling = head_dim ** -0.5
-        
-        residual = hidden_states.data
-        hidden_norm = self.rms_norm(residual, norm_weight=w_norm.data, eps=config.rms_norm_eps)
-        
-        # shape: (b, s, h)
-        q = F.linear(hidden_norm, w_q.data) * scaling
-        k = F.linear(hidden_norm, w_k.data)
-        v = F.linear(hidden_norm, w_v.data)
-
-        # 重塑为多头形式
-        # shape: (b, s, n_head, head_dim)
-        q = q.view(bsz, seq_len, n_q_head, head_dim)
-        k = k.view(bsz, seq_len, n_kv_head, head_dim)
-        v = v.view(bsz, seq_len, n_kv_head, head_dim)
-
-        # 应用RoPE
-        q, k = self.apply_rotary_emb(q, k, freqs_cis=compute_device.rotary_emb_cis[:seq_len])
-
-        # # shape: (b * n_head, s, head_dim)
-        # q = q.permute(0, 2, 1, 3).reshape(bsz * n_head, seq_len, head_dim)
-        # # shape: (b * n_head, head_dim, s)
-        # k = k.permute(0, 2, 3, 1).reshape(bsz * n_head, head_dim, seq_len)
-        # # shape: (b * n_head, s, head_dim)
-        # v = v.permute(0, 2, 1, 3).reshape(bsz * n_head, seq_len, head_dim)
-
-        # attn_weights = torch.bmm(q, k)
-
-        # idx = torch.arange(seq_len).to(compute_device.dev)
-        # causal_mask = (idx <= idx.view(seq_len, 1)).view(1, 1, seq_len, seq_len)
-        # mask = attention_mask.data.view(bsz, 1, 1, seq_len) & causal_mask
-
-        # # shape: (b, n_head, s, s)
-        # attn_weights = attn_weights.view(bsz, n_head, seq_len, seq_len)
-        # attn_weights = torch.where(mask, attn_weights, -1e4)
-        # attn_weights = attn_weights.view(bsz * n_head, seq_len, seq_len)
-        # attn_weights = F.softmax(attn_weights, dim=2)
-        # # shape: (b, n_head, s, head_dim)
-        # value = torch.bmm(attn_weights, v).view(bsz, n_head, seq_len, head_dim)
-        # # shape: (b, s, h)
-        # value = value.transpose(1, 2).reshape(bsz, seq_len, h)
-        # value = F.linear(value, w_o.data)
-
-        # value.add_(hidden_states.data)
-
-        # if donate[0]: hidden_states.delete()
-        # if donate[1]: attention_mask.delete()
-
-        # # (s, b * n_head, head_dim)
-        # k = k.permute(2, 0, 1)
-        # v = v.permute(1, 0, 2)
-
-        # if compress_cache:
-        #     k = self.compressed_device.compress(k, comp_config)
-        #     v = self.compressed_device.compress(v, comp_config)
-        # else:
-        #     k = TorchTensor.create_from_torch(k, compute_device)
-        #     v = TorchTensor.create_from_torch(v, compute_device)
-
-        # return TorchTensor.create_from_torch(value, compute_device), k, v
-        # 先将原始的 K 和 V 保存起来, 以便之后存入缓存
-        k_for_cache = k # shape: (b, s, n_head, head_dim)
-        v_for_cache = v # shape: (b, s, n_head, head_dim)
-        
-        # 重复kv头以匹配q头数 if n_kv_heads < n_heads
-        k = self.repeat_kv(k, num_key_value_groups) # (bs, seqlen, n_local_heads, head_dim)
-        v = self.repeat_kv(v, num_key_value_groups) # (bs, seqlen, n_local_heads, head_dim)
-
-        # 转置后注意力计算
-        # shape: (b, n_head, s*, head_dim)
-        # q: s* is seq_len
-        # keys, values: s* is cache_len + seq_len
-        q = q.transpose(1, 2) # (bs, n_local_heads, seqlen, head_dim)
-        k = k.transpose(1, 2) # (bs, n_local_heads, seqlen, head_dim)
-        v = v.transpose(1, 2) # (bs, n_local_heads, seqlen, head_dim)
-        # shape: (b, n_head, s_q, s_keys)
-        scores = torch.matmul(q, k.transpose(2, 3)) / (head_dim ** 0.5)
-
-        # # 计算注意力分数
-        # # mask shape is (b, s_q)
-        # mask = attention_mask.data
-        # if mask is not None:
-        #     scores = scores + mask.unsqueeze(1).unsqueeze(-1)
-        
-        # 应用因果掩码 (causal mask) 防止看到未来 token
-        # 只有在 prefill 阶段 (seq_len > 1) 才需要
-        if seq_len > 1:
-            # 创建一个上三角矩阵, 对角线以上的位置被设置为-inf
-            causal_mask = torch.full((1, 1, seq_len, seq_len), float("-inf"), device=scores.device)
-            causal_mask = torch.triu(causal_mask, diagonal=1)
-            scores = scores + causal_mask # (bs, n_local_heads, seqlen, seqlen)
-        scores = F.softmax(scores.float(), dim=-1).type_as(q)
-
-        output = torch.matmul(scores, v) # (bs, n_local_heads, seqlen, head_dim)
-
-        output = output.transpose(1, 2).contiguous().view(bsz, seq_len, -1)
-
-        output = F.linear(output, w_o.data) + residual
-        
-
-        if donate[0]: hidden_states.delete()
-        if donate[1]: attention_mask.delete()
-
-        if compress_cache:
-            k_to_cache = compute_device.compressed_device.compress(k_for_cache, comp_config)
-            v_to_cache = compute_device.compressed_device.compress(v_for_cache, comp_config)
-        else:
-            k_to_cache = TorchTensor.create_from_torch(k_for_cache, compute_device)
-            v_to_cache = TorchTensor.create_from_torch(v_for_cache, compute_device)
-
-        return TorchTensor.create_from_torch(output, compute_device), k_to_cache, v_to_cache
-
-    # SelfAttention Decode
-    def mha_gen(self, compute_device: TorchDevice, hidden_states: TorchTensor, attention_mask: TorchTensor,
-                w_q: TorchTensor, w_k: TorchTensor, w_v: TorchTensor, w_o: TorchTensor, w_norm: TorchTensor,
-                n_head: int, config: FlexModelConfig, donate: list, compress_cache: bool, comp_config: any,
-                attn_sparsity:Union[int, float], k_cache: Union[TorchTensor, ValueHolder], v_cache: Union[TorchTensor, ValueHolder]):
-
-        
-        if w_q.device.device_type == DeviceType.COMPRESSED:
-            w_q, w_k, w_v, w_o, w_norm = [x.device.decompress(x) for x in [w_q, w_k, w_v, w_o, w_norm]]
-
-        bsz, tgt_s, h = hidden_states.shape # tgt_s is 1
-        src_s = attention_mask.shape[1] # cache_len + seq_len
-        n_q_head = n_head
-        n_kv_head = getattr(config, 'num_key_value_heads', n_q_head)
-        num_key_value_groups = n_q_head // n_kv_head
-        head_dim = h // n_q_head
-        scaling = head_dim ** -0.5
-                       
-        residual = hidden_states.data # shape (bsz, tgt_s, h)
-        hidden_norm = self.rms_norm(residual, norm_weight=w_norm.data, eps=config.rms_norm_eps)
-
-        # 1. 计算当前步的 Q, K, V
-        q = F.linear(hidden_norm, w_q.data) * scaling # shape: (bsz, tgt_s, h)
-        k_new = F.linear(hidden_norm, w_k.data) # shape: (bsz, tgt_s, h)
-        v_new = F.linear(hidden_norm, w_v.data) # shape: (bsz, tgt_s, h)
-
-        q = q.view(bsz, tgt_s, n_q_head, head_dim) # shape: (bsz, tgt_s, n_head, head_dim)
-        k_new = k_new.view(bsz, tgt_s, n_kv_head, head_dim) # shape: (bsz, tgt_s, n_head, head_dim)
-        v_new = v_new.view(bsz, tgt_s, n_kv_head, head_dim) # shape: (bsz, tgt_s, n_head, head_dim)
-
-        q, k_new = self.apply_rotary_emb(q, k_new, freqs_cis=compute_device.rotary_emb_cis[src_s:src_s+tgt_s])
-        q_for_attn = q.transpose(1, 2) # shape: (bsz, n_head, tgt_s, head_dim)
-
-        if isinstance(k_cache, TorchTensor):
-            if attn_sparsity >= 1.0:  # Dense attention
-                if compress_cache:
-                    past_k = k_cache.device.decompress(k_cache) # shape: (bsz, src_s-1, n_head, head_dim)
-                    past_v = v_cache.device.decompress(v_cache) # shape: (bsz, src_s-1, n_head, head_dim)
-                else:
-                    past_k = k_cache.data # shape: (bsz, src_s-1, n_head, head_dim)
-                    past_v = v_cache.data # shape: (bsz, src_s-1, n_head, head_dim)
-                
-                # 更新最新的 kvcache 非 repeated 的部分
-                # k[:, :, src_s - 1:src_s] = k_new
-                # v[:, :, src_s - 1:src_s] = v_new
-                keys = torch.cat([past_k, k_new], dim=1)
-                values = torch.cat([past_v, v_new], dim=1)
-                # print(f"k, v shape {keys.shape}, {values.shape}")
-                keys_for_attn = self.repeat_kv(keys, num_key_value_groups).transpose(1, 2) # shape: (bsz, n_head, src_s, head_dim)
-                values_for_attn = self.repeat_kv(values, num_key_value_groups).transpose(1, 2) # shape: (bsz, n_head, src_s, head_dim)
-                # print(f"keys and values shape: {keys_for_attn.shape}, {values_for_attn.shape}")
-                # print(f"q_for_attn shape: {q_for_attn.shape}")
-                # k[:, :, src_s - 1:src_s] = k_new.transpose(1,2)
-                # v[:, :, src_s - 1:src_s] = v_new.transpose(1,2)
-
-                if keys_for_attn.is_cuda:
-                    attn_weights = self._attention_weights(q_for_attn, keys_for_attn)
-                    value = self._attention_value(attn_weights, values_for_attn)  # (b, n_head, 1, head_dim)
-                else:
-                    q_for_attn = q_for_attn.float().cpu()
-                    keys_for_attn, values_for_attn = keys_for_attn.float(), values_for_attn.float()
-                    attn_weights = self._attention_weights(q_for_attn, keys_for_attn)
-                    value = self._attention_value(attn_weights, values_for_attn)  # (b, n_head, 1, head_dim)
-            else:  # Sparse attention
-                
-                past_k = k_cache.data
-                keys = torch.cat([past_k, k_new], dim=1)
-                keys_for_attn = self.repeat_kv(keys, num_key_value_groups).transpose(1, 2) # shape: (bsz, n_head, src_s, head_dim)
-                values_for_attn = self.repeat_kv(values, num_key_value_groups).transpose(1, 2) # shape: (bsz, n_head, src_s, head_dim)
-
-                if keys_for_attn.is_cuda:
-                    value = self._sparse_attention_value(
-                        compute_device, q_for_attn, keys_for_attn, values_for_attn, v_cache,
-                        attention_mask.data, bsz, src_s, tgt_s, n_head, head_dim, attn_sparsity
-                        )
-                else:
-                    q_for_attn = q_for_attn.float().cpu()
-                    value = self._sparse_attention_value(
-                        compute_device, q_for_attn, keys_for_attn, values_for_attn, v_cache,
-                        attention_mask.data, bsz, src_s, tgt_s, n_head, head_dim, attn_sparsity
-                    )
-                    value = value.cuda().half()
-        else:  # Mixed device attention
-            assert attn_sparsity >= 1.0
-            value = self._mixed_device_attention(compute_device, q_for_attn, k_cache, v_cache,
-                keys_for_attn, values_for_attn, attention_mask.data, bsz, src_s, tgt_s,
-                n_head, head_dim)
-
-        # print(f"attention weights: {attn_weights.shape}, value from attn: {value.shape}")
+        # print(f"DEBUG: token_embed shape and dtype: {token_embed.shape}, {token_embed.dtype}")
         # exit()
+        return TorchTensor.create_from_torch(token_embed, compute_device)
 
-        value = value.transpose(1, 2).contiguous().view(bsz, tgt_s, -1)
+    def output_embed(self, compute_device, inputs, w_ln, w_token, donate,
+                     do_sample, temperature):
+        """输出嵌入层 - 使用RMSNorm"""
+        if w_token.device.device_type == DeviceType.COMPRESSED:
+            w_token = w_token.device.decompress(w_token)
+
+        b, s, h = inputs.shape
         
-        # 7. 计算最终输出
-        output = F.linear(value, w_o.data) + residual
+        # 调试隐藏状态
+        # print(f"DEBUG: 输入隐藏状态形状: {inputs.data.shape}")
+        # print(f"DEBUG: 输入隐藏状态范围: [{inputs.data.min().item():.4f}, {inputs.data.max().item():.4f}]")
+        # print(f"DEBUG: 输入隐藏状态均值: {inputs.data.mean().item():.4f}, 标准差: {inputs.data.std().item():.4f}")
         
-        if donate[0]: hidden_states.delete()
-        if donate[1]: attention_mask.delete()
-
-        # 8. 返回的 k_new/v_new 用于写入缓存，保持原始布局, 
-        if compress_cache:
-            # # shape: (bsz, tgt_s, n_head, head_dim)
-            # s_ = src_s // comp_config.group_size * comp_config.group_size
-            # k_new = k_new.view()[:, :, :, s_:].permute(2, 0, 1)
-            # v_new = v_new[:, s_:, :].permute(1, 0, 2)
-            k_new_to_cache = compute_device.compressed_device.compress(k_new, comp_config)
-            v_new_to_cache = compute_device.compressed_device.compress(v_new, comp_config)
-        else:
-            k_new_to_cache = TorchTensor.create_from_torch(k_new, compute_device)
-            v_new_to_cache = TorchTensor.create_from_torch(v_new, compute_device)
-
-        return TorchTensor.create_from_torch(output, compute_device), k_new_to_cache, v_new_to_cache
-    
-        # """Multi-head attention (decoding phase)."""
-        # # decompress weights
-        # if w_q.device.device_type == DeviceType.COMPRESSED:
-        #     w_q = w_q.device.decompress(w_q)
-        #     w_k = w_k.device.decompress(w_k)
-        #     w_v = w_v.device.decompress(w_v)
-        #     w_out = w_out.device.decompress(w_out)
-
-        # b, tgt_s, h = hidden_states.shape
-        # src_s = attention_mask.shape[1]
-        # head_dim = h // n_head
-        # # freq_cis = self.precompute_freqs_cis(head_dim, 2048 * 2, rotary_emb_inv_freq.data)
-        # scaling = head_dim ** -0.5
-
-        # hidden = self.rms_norm(hidden_states.data, w_norm.data)
-        # # hidden = F.layer_norm(inputs.data, (h,), weight=input_layernorm.data)
-
-        # # shape: (b, 1, h)
-        # q = F.linear(hidden, w_q.data) * scaling
-        # k = F.linear(hidden, w_k.data)
-        # v = F.linear(hidden, w_v.data)
-        # # shape: (b, 1, n_head, head_dim)
-        # q = q.view(b, tgt_s, n_head, head_dim)
-        # k = k.view(b, tgt_s, n_head, head_dim)
-        # v = v.view(b, tgt_s, n_head, head_dim)
-        # q, k = self.apply_rotary_emb(q, k, freqs_cis=compute_device.rotary_emb_cis[src_s:src_s+tgt_s])
-
-        # # shape: (b * n_head, 1, head_dim)
-        # q = q.permute(0, 2, 1, 3).reshape(b * n_head, tgt_s, head_dim)
-        # # shape: (1, b * n_head, head_dim)
-        # k_new = k.permute(1, 0, 2, 3).reshape(tgt_s, b * n_head, head_dim)
-        # # shape: (1, b * n_head, head_dim)
-        # v_new = v.permute(1, 0, 2, 3).reshape(tgt_s, b * n_head, head_dim)
-        # if isinstance(k_cache, TorchTensor):
-        #     if attn_sparsity >= 1.0:  # Dense attention
-        #         if compress_cache:
-        #             # shape: (s, b * n_head, head_dim)
-        #             k = k_cache.device.decompress(k_cache)[:src_s]
-        #             v = v_cache.device.decompress(v_cache)[:src_s]
-        #         else:
-        #             # shape: (s, b * n_head, head_dim)
-        #             k = k_cache.data[:src_s]
-        #             v = v_cache.data[:src_s]
-        #         k[src_s - 1:src_s] = k_new
-        #         v[src_s - 1:src_s] = v_new
-        #         # shape: (b * n_head, head_dim, s)
-        #         k = k.permute(1, 2, 0).reshape(b * n_head, head_dim, src_s)
-        #         # shape: (b * n_head, s, head_dim)
-        #         v = v.permute(1, 0, 2).reshape(b * n_head, src_s, head_dim)
-        #         if k.is_cuda:
-        #             value = self._attention_value(q, k, v, attention_mask.data,
-        #                 b, src_s, tgt_s, n_head, head_dim)
-        #         else:
-        #             q = q.float().cpu()
-        #             k, v = k.float(), v.float()
-        #             value = self._attention_value(q, k, v, attention_mask.data,
-        #                 b, src_s, tgt_s, n_head, head_dim).cuda().half()
-        #     else:  # Sparse attention
-        #         # shape: (s, b * n_head, head_dim)
-        #         k = k_cache.data[:src_s]
-        #         k[src_s - 1:src_s] = k_new
-        #         # shape: (b * n_head, head_dim, s)
-        #         k = k.permute(1, 2, 0).reshape(b * n_head, head_dim, src_s)
-
-        #         if k.is_cuda:
-        #             value = self._sparse_attention_value(q, k, v_new, v_cache,
-        #                 attention_mask.data, b, src_s, tgt_s, n_head, head_dim,
-        #                 attn_sparsity)
-        #         else:
-        #             q = q.float().cpu()
-        #             value = self._sparse_attention_value(q, k, v_new, v_cache,
-        #                 attention_mask.data, b, src_s, tgt_s, n_head, head_dim,
-        #                 attn_sparsity).cuda().half()
-        # else:  # Mixed device attention
-        #     assert attn_sparsity >= 1.0
-        #     value = self._mixed_device_attention(q, k_cache, v_cache,
-        #         k_new, v_new, attention_mask.data, b, src_s, tgt_s,
-        #         n_head, head_dim)
-
-        # # shape: (b, 1, h)
-        # value = value.transpose(1, 2).view(b, tgt_s, h)
-        # value = F.linear(value, w_out.data)
-
-        # value.add_(hidden_states.data)
-
-        # if donate[0]: hidden_states.delete()
-        # if donate[1]: attention_mask.delete()
-
-        # if compress_cache:
-        #     if comp_config.group_dim == 0:
-        #         s_ = src_s // comp_config.group_size * comp_config.group_size
-        #         k_new = k[:, :, s_:].permute(2, 0, 1)
-        #         v_new = v[:, s_:, :].permute(1, 0, 2)
-        #     k_new = self.compressed_device.compress(k_new, comp_config)
-        #     v_new = self.compressed_device.compress(v_new, comp_config)
-        # else:
-        #     k_new = TorchTensor.create_from_torch(k_new, compute_device)
-        #     v_new = TorchTensor.create_from_torch(v_new, compute_device)
-
-        # return TorchTensor.create_from_torch(value, compute_device), k_new, v_new
-    
-    def mha_gen_old(self, compute_device: TorchDevice, hidden_states: TorchTensor, attention_mask: TorchTensor,
-                w_q: TorchTensor, w_k: TorchTensor, w_v: TorchTensor, w_o: TorchTensor, w_norm: TorchTensor,
-                n_head: int, config: FlexModelConfig, donate: list, compress_cache: bool, comp_config: any,
-                attn_sparsity:Union[int, float], k_cache: Union[TorchTensor, ValueHolder], v_cache: Union[TorchTensor, ValueHolder]):
-
-        if w_q.device.device_type == DeviceType.COMPRESSED:
-            w_q, w_k, w_v, w_o = [x.device.decompress(x) for x in [w_q, w_k, w_v, w_o]]
-
-        bsz, tgt_s, h = hidden_states.shape
-        src_s = attention_mask.shape[1]
-        n_q_head = n_head
-        n_kv_head = getattr(config, 'num_key_value_heads', n_q_head)
-        num_key_value_groups = n_q_head // n_kv_head
-        head_dim = h // n_q_head
-                       
-        residual = hidden_states.data
-        hidden_norm = self.rms_norm(residual, norm_weight=w_norm.data, eps=config.rms_norm_eps)
-
-        # shape: (b, tgt_s, h)
-        q = F.linear(hidden_norm, w_q.data)
-        k_new = F.linear(hidden_norm, w_k.data)
-        v_new = F.linear(hidden_norm, w_v.data)
-
-        # shape: (b, tgt_s, n_head, head_dim) n_head*head_dim = h
-        q = q.view(bsz, tgt_s, n_q_head, head_dim)
-        k_new = k_new.view(bsz, tgt_s, n_kv_head, head_dim)
-        v_new = v_new.view(bsz, tgt_s, n_kv_head, head_dim)
-
-        # 应用RoPE
-        q, k_new = self.apply_rotary_emb(q, k_new, freqs_cis=compute_device.rotary_emb_cis[src_s - 1 : src_s])
-
-        k_repeated = self.repeat_kv(k_new, num_key_value_groups)
-        v_repeated = self.repeat_kv(v_new, num_key_value_groups)
-
-        # # 将原始的 k_new/v_new 保存
-        # k_new_for_cache = k_new.transpose(1, 2)
-        # v_new_for_cache = v_new.transpose(1, 2)
-
-        # k_repeated = self.repeat_kv(k_new, num_key_value_groups)
-        # v_repeated = self.repeat_kv(v_new, num_key_value_groups)
-
-        # 转置后注意力计算
-        # shape: (b, n_head, s*, head_dim)
-        # q: s* is seq_len
-        # keys, values: s* is cache_len + seq_len
-        q = q.transpose(1, 2)
-        k_repeated = k_repeated.transpose(1, 2)
-        v_repeated = v_repeated.transpose(1, 2)
-
-        if isinstance(k_cache, TorchTensor):
-            if attn_sparsity >= 1.0:  # Dense attention
-                if compress_cache:
-                    # shape: (b, n_head, s, head_dim)
-                    k = k_cache.device.decompress(k_cache)[:, :, :src_s]
-                    v = v_cache.device.decompress(v_cache)[:, :, :src_s]
-                else:
-                    # shape: (b, n_head, s, head_dim)
-                    k = k_cache.data[:, :, :src_s]
-                    v = v_cache.data[:, :, :src_s]
-                
-                # 更新最新的 kvcache
-                # k[:, :, src_s - 1:src_s] = k_new
-                # v[:, :, src_s - 1:src_s] = v_new
-                k[:, :, src_s - 1:src_s] = k_new.transpose(1,2)
-                v[:, :, src_s - 1:src_s] = v_new.transpose(1,2)
-
-                if k.is_cuda:
-                    attn_weights = self._attention_weights(compute_device, q, k, attention_mask.data)
-                    value = self._attention_value(attn_weights, v)  # (b, n_head, 1, head_dim)
-                else:
-                    q = q.float().cpu()
-                    k, v = k.float(), v.float()
-                    attn_weights = self._attention_weights(compute_device, q, k, attention_mask.data)
-                    value = self._attention_value(attn_weights, v)  # (b, n_head, 1, head_dim)
-            else:  # Sparse attention
-                # shape: (b, n_head, s, head_dim)
-                k = k_cache.data[:, :, :src_s]
-                k[:, :, src_s - 1:src_s] = k_new
-
-                if k.is_cuda:
-                    value = self._sparse_attention_value(
-                        compute_device, q, k, v_repeated, v_cache,
-                        attention_mask.data, bsz, src_s, tgt_s, n_head, head_dim, attn_sparsity
-                        )
-                else:
-                    q = q.float().cpu()
-                    value = self._sparse_attention_value(
-                        compute_device, q, k, v_repeated, v_cache,
-                        attention_mask.data, bsz, src_s, tgt_s, n_head, head_dim, attn_sparsity
-                    )
-                    value = value.cuda().half()
-        else:  # Mixed device attention
-            assert attn_sparsity >= 1.0
-            value = self._mixed_device_attention(compute_device, q, k_cache, v_cache,
-                k_repeated, v_repeated, attention_mask.data, bsz, src_s, tgt_s,
-                n_head, head_dim)
-
-        # value shape: (b, n_head, 1, head_dim)
-        value = value.transpose(1, 2).contiguous().view(bsz, tgt_s, -1)
-        value = F.linear(value, w_o.data) + residual
+        # 保存输入隐藏状态数据
+        if hasattr(self, 'debug_data'):
+            self.debug_data['input_hidden_state'] = {
+                'shape': list(inputs.data.shape),
+                'range': [inputs.data.min().item(), inputs.data.max().item()],
+                'mean': inputs.data.mean().item(),
+                'std': inputs.data.std().item(),
+                'tensor': inputs.data.cpu().numpy()
+            }
         
-        if donate[0]: hidden_states.delete()
-        if donate[1]: attention_mask.delete()
+        # RMSNorm instead of LayerNorm
+        hidden = self.rms_norm(inputs.data, w_ln.data)
+        
+        # 调试RMSNorm后的隐藏状态
+        # print(f"DEBUG: RMSNorm后隐藏状态范围: [{hidden.min().item():.4f}, {hidden.max().item():.4f}]")
+        # print(f"DEBUG: RMSNorm后隐藏状态均值: {hidden.mean().item():.4f}, 标准差: {hidden.std().item():.4f}")
+        
+        # 保存RMSNorm后的隐藏状态数据
+        if hasattr(self, 'debug_data'):
+            self.debug_data['normalized_hidden_state'] = {
+                'range': [hidden.min().item(), hidden.max().item()],
+                'mean': hidden.mean().item(),
+                'std': hidden.std().item(),
+                'tensor': hidden.cpu().numpy()
+            }
+        
+        if donate[0]: inputs.delete()
 
-        if compress_cache:
-            k_new_for_cache = compute_device.compressed_device.compress(k_new, comp_config)
-            v_new_for_cache = compute_device.compressed_device.compress(v_new, comp_config)
-        else:
-            k_new_for_cache = TorchTensor.create_from_torch(k_new, compute_device)
-            v_new_for_cache = TorchTensor.create_from_torch(v_new, compute_device)
-
-        return TorchTensor.create_from_torch(value, compute_device), k_new_for_cache, v_new_for_cache
-    
-    def mlp(self, compute_device: TorchDevice, hidden_states: TorchTensor,
-            w_gate: TorchTensor, w_up: TorchTensor, w_down: TorchTensor, w_norm: TorchTensor,
-            config: FlexModelConfig, donate: list):
-        
-        if w_gate.device.device_type == DeviceType.COMPRESSED:
-            w_gate, w_up, w_down, w_norm = [x.device.decompress(x) for x in [w_gate, w_up, w_down, w_norm]]
-        
-        residual = hidden_states.data # shape: (bsz, tgt_s, h)
-        hidden_norm = self.rms_norm(hidden_states.data, norm_weight=w_norm.data, eps=config.rms_norm_eps)
-        
-        act_fn = ACT2FN[config.hidden_act]
-        out = F.linear(act_fn(F.linear(hidden_norm, w_gate.data)) * F.linear(hidden_norm, w_up.data), w_down.data)
-        out.add_(residual)
-        # gate = F.linear(hidden_norm, w_gate.data) # shape: (b, s, h, 4h)
-        # up = F.linear(hidden_norm, w_up.data) # shape: (b, s, h, 4h)
-        # down = F.linear(F.silu(gate) * up, w_down.data) # shape: (b, s, h, h)
-        
-        # down.add_(residual)
-        if donate[0]: hidden_states.delete()
-        
-        return TorchTensor.create_from_torch(out, compute_device)
-
-    def output_embed(self, compute_device: TorchDevice, hidden_states: TorchTensor, w_lm_head: TorchTensor, donate: list, do_sample: bool, temperature: float):
-        if w_lm_head.device.device_type == DeviceType.COMPRESSED:
-            w_lm_head = w_lm_head.device.decompress(w_lm_head)
-
-        logits = F.linear(hidden_states.data, w_lm_head.data)
+        # output embedding
+        logits = F.linear(hidden, w_token.data)
         last_token_logits = logits[:,-1,:]
+
+        # 详细的调试信息
+        # print(f"DEBUG: Last token logits shape: {last_token_logits.shape}")
+        # print(f"DEBUG: do_sample={do_sample}, temperature={temperature}")
+        # print(f"DEBUG: Logits range: [{last_token_logits.min().item():.4f}, {last_token_logits.max().item():.4f}]")
+        # print(f"DEBUG: Logits mean: {last_token_logits.mean().item():.4f}, std: {last_token_logits.std().item():.4f}")
+        
+        # 保存logits数据
+        if hasattr(self, 'debug_data'):
+            self.debug_data['logits'] = {
+                'shape': list(logits.shape),
+                'range': [logits.min().item(), logits.max().item()],
+                'mean': logits.mean().item(),
+                'std': logits.std().item(),
+                'tensor': logits.cpu().numpy(),
+                'last_token_logits': {
+                    'shape': list(last_token_logits.shape),
+                    'range': [last_token_logits.min().item(), last_token_logits.max().item()],
+                    'mean': last_token_logits.mean().item(),
+                    'std': last_token_logits.std().item(),
+                    'tensor': last_token_logits.cpu().numpy()
+                }
+            }
+        
+        # 检查logits是否异常
+        if torch.isinf(last_token_logits).any() or torch.isnan(last_token_logits).any():
+            print(f"ERROR: Logits contains inf/nan!")
+            last_token_logits = torch.nan_to_num(last_token_logits, nan=0.0, posinf=100.0, neginf=-100.0)
+        
+        # 显示前10个最高的logits值和对应的token ID
+        top_logits, top_indices = torch.topk(last_token_logits[0], 10)
+        # print(f"DEBUG: Top 10 logits: {top_logits.tolist()}")
+        # print(f"DEBUG: Top 10 indices: {top_indices.tolist()}")
+        
+        # 保存top-k数据
+        if hasattr(self, 'debug_data'):
+            self.debug_data['top_k'] = {
+                'logits': top_logits.cpu().numpy(),
+                'indices': top_indices.cpu().numpy()
+            }
 
         if do_sample and not temperature < 1e-5:
             probs = torch.softmax(last_token_logits / temperature, dim=-1)
             ids = torch.multinomial(probs, num_samples=1)
         else:
             ids = last_token_logits.argmax(dim=1, keepdim=True)
-            
-        if donate[0]: hidden_states.delete()
+        
+        # print(f"DEBUG: Generated token IDs: {ids.cpu().numpy()}")
+        # print(f"DEBUG: Generated token ID range: [{ids.min().item()}, {ids.max().item()}]")
+        
+        # 检查生成的token ID是否在合理范围内
+        vocab_size = w_token.data.shape[0]
+        if ids.max().item() >= vocab_size:
+            print(f"ERROR: Generated token ID {ids.max().item()} >= vocab_size {vocab_size}")
+        if ids.min().item() < 0:
+            print(f"ERROR: Generated token ID {ids.min().item()} < 0")
+        
+        # 检查是否总是生成相同的token（循环检测）
+        if hasattr(self, '_last_generated_id'):
+            if torch.equal(ids, self._last_generated_id):
+                print(f"WARNING: Generated same token as last time!")
+        self._last_generated_id = ids.clone()
+        
+        # print("="*60)
         
         return TorchTensor.create_from_torch(ids, compute_device), TorchTensor.create_from_torch(logits, compute_device)
+
+    
+    def mha(self, compute_device, inputs, attention_mask, w_q, w_k, w_v, w_out, w_ln,
+        n_head, n_kv_heads, freqs_cis, donate, compress_cache, comp_config):
+        """
+        mha 的最终调试版本，会打印每一步的中间结果。
+        """
+
+        b, s, h = inputs.shape
+        head_dim = h // n_head
+        
+
+        # 1. 前置归一化
+        residual = inputs.data
+        hidden = self.rms_norm(inputs.data, w_ln.data)
+       
+
+        # 2. QKV 线性投射
+        q = F.linear(hidden, w_q.data)
+        k = F.linear(hidden, w_k.data)
+        v = F.linear(hidden, w_v.data)
+       
+
+        # 3. Reshape 和 Transpose
+        query_states = q.view(b, s, n_head, head_dim).transpose(1, 2)
+        key_states = k.view(b, s, n_kv_heads, head_dim).transpose(1, 2)
+        value_states = v.view(b, s, n_kv_heads, head_dim).transpose(1, 2)
+
+        # 4. RoPE
+        cos_half = freqs_cis.real.to(query_states.dtype); sin_half = freqs_cis.imag.to(query_states.dtype)
+        cos = torch.cat((cos_half, cos_half), dim=-1); sin = torch.cat((sin_half, sin_half), dim=-1)
+        cos = cos.unsqueeze(0).unsqueeze(0); sin = sin.unsqueeze(0).unsqueeze(0)
+        def rotate_half(x):
+            x1 = x[..., : x.shape[-1] // 2]; x2 = x[..., x.shape[-1] // 2 :]
+            return torch.cat((-x2, x1), dim=-1)
+        query_states = (query_states * cos) + (rotate_half(query_states) * sin)
+        key_states = (key_states * cos) + (rotate_half(key_states) * sin)
+
+        # 5. GQA
+        k_for_cache = key_states.transpose(1,2).contiguous()
+        v_for_cache = value_states.transpose(1,2).contiguous()
+        def repeat_kv_official(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
+            batch, num_key_value_heads, slen, head_dim_inner = hidden_states.shape
+            if n_rep == 1: return hidden_states
+            hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim_inner)
+            return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim_inner)
+        key_states = repeat_kv_official(key_states, n_head // n_kv_heads)
+        value_states = repeat_kv_official(value_states, n_head // n_kv_heads)
+
+        # 6. 注意力得分
+        scaling = head_dim ** -0.5
+        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) * scaling
+
+        # # 7. 遮罩
+        mask_fill_value = torch.finfo(torch.float16).min
+    
+        if s > 1:
+            causal_mask = torch.triu(torch.full((s, s), mask_fill_value, device=attn_weights.device), diagonal=1)
+            causal_mask = causal_mask.unsqueeze(0).unsqueeze(0)
+            attn_weights = attn_weights + causal_mask
+        if attention_mask is not None:
+            padding_mask = ~(attention_mask.data.bool()).view(b, 1, 1, s)
+            attn_weights = attn_weights.masked_fill(padding_mask, mask_fill_value)
+
+        # 8. Softmax
+        attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+
+        # 9. 应用于V
+        attn_output = torch.matmul(attn_weights, value_states)
+
+        # 10. 输出 reshape 和投影
+        attn_output = attn_output.transpose(1, 2).contiguous()
+        attn_output = attn_output.reshape(b, s, h)
+        value = F.linear(attn_output, w_out.data) + residual
+
+        if donate[0]: inputs.delete(); 
+        if donate[1]: attention_mask.delete()
+        k = k_for_cache.permute(1, 0, 2, 3).reshape(s, b * n_kv_heads, head_dim)
+        v = v_for_cache.permute(1, 0, 2, 3).reshape(s, b * n_kv_heads, head_dim)
+
+        if compress_cache:
+            k = compute_device.compressed_device.compress(k, comp_config)
+            v = compute_device.compressed_device.compress(v, comp_config)
+        else:
+            k = TorchTensor.create_from_torch(k, compute_device)
+            v = TorchTensor.create_from_torch(v, compute_device)
+        return TorchTensor.create_from_torch(value, compute_device), k, v
+
+    def mha_gen(self, compute_device, inputs, attention_mask, w_q, w_k, w_v, w_out, w_ln,
+            n_head, n_kv_heads, k_cache, v_cache, freqs_cis, donate,
+            attn_sparsity, compress_cache, comp_config):
+        """
+        Multi-head attention (decoding phase) - Final corrected version for K/V cache shaping.
+        """
+        if w_q.device.device_type == DeviceType.COMPRESSED:
+            w_q, w_k, w_v, w_out = [w.device.decompress(w) for w in [w_q, w_k, w_v, w_out]]
+
+        b, tgt_s, h = inputs.shape
+        src_s = attention_mask.shape[1]
+        head_dim = h // n_head
+
+        # 1. 前置归一化
+        residual = inputs.data
+        hidden = self.rms_norm(inputs.data, w_ln.data)
+
+        # 2. QKV 线性投射
+        q = F.linear(hidden, w_q.data)
+        k = F.linear(hidden, w_k.data)
+        v = F.linear(hidden, w_v.data)
+
+        # 3. 重塑和转置
+        query_states = q.view(b, tgt_s, n_head, head_dim).transpose(1, 2)
+        key_states = k.view(b, tgt_s, n_kv_heads, head_dim).transpose(1, 2)
+        value_states = v.view(b, tgt_s, n_kv_heads, head_dim).transpose(1, 2)
+
+        # 4. RoPE
+        cos_half = freqs_cis.real.to(query_states.dtype)
+        sin_half = freqs_cis.imag.to(query_states.dtype)
+        cos = torch.cat((cos_half, cos_half), dim=-1)
+        sin = torch.cat((sin_half, sin_half), dim=-1)
+        cos = cos.unsqueeze(0).unsqueeze(0)
+        sin = sin.unsqueeze(0).unsqueeze(0)
+        
+        def rotate_half(x):
+            x1 = x[..., : x.shape[-1] // 2]
+            x2 = x[..., x.shape[-1] // 2 :]
+            return torch.cat((-x2, x1), dim=-1)
+
+        query_states = (query_states * cos) + (rotate_half(query_states) * sin)
+        key_states = (key_states * cos) + (rotate_half(key_states) * sin)
+        
+        # 5. 准备 k_new 和 v_new 用于 cache
+        k_new_for_cache = key_states.permute(2, 0, 1, 3).contiguous().reshape(-1, b * n_kv_heads, head_dim)
+        v_new_for_cache = value_states.permute(2, 0, 1, 3).contiguous().reshape(-1, b * n_kv_heads, head_dim)
+
+        if isinstance(k_cache, TorchTensor):
+            if compress_cache:
+                k_cached = k_cache.device.decompress(k_cache)[:src_s-tgt_s]
+                v_cached = v_cache.device.decompress(v_cache)[:src_s-tgt_s]
+            else:
+                k_cached = k_cache.data[:src_s-tgt_s]
+                v_cached = v_cache.data[:src_s-tgt_s]
+            
+            k_all = torch.cat([k_cached, k_new_for_cache], dim=0) # shape: (src_s, b * n_kv_heads, head_dim)
+            v_all = torch.cat([v_cached, v_new_for_cache], dim=0)
+        else:
+            k_all = k_new_for_cache # shape: (tgt_s, b * n_kv_heads, head_dim)
+            v_all = v_new_for_cache # shape: (tgt_s, b * n_kv_heads, head_dim)
+        
+        # 直接从 k_all 张量获取其真实的序列长度
+        actual_seq_len = k_all.shape[0]
+        # 使用真实长度进行 view 操作，并为保证内存连续性添加 .contiguous()
+        key_states = k_all.permute(1, 0, 2).contiguous().view(b, n_kv_heads, actual_seq_len, head_dim)
+        value_states = v_all.permute(1, 0, 2).contiguous().view(b, n_kv_heads, actual_seq_len, head_dim)
+
+        def repeat_kv_official(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
+            batch, num_key_value_heads, slen, head_dim_inner = hidden_states.shape
+            if n_rep == 1:
+                return hidden_states
+            hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim_inner)
+            return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim_inner)
+
+        key_states = repeat_kv_official(key_states, n_head // n_kv_heads)
+        value_states = repeat_kv_official(value_states, n_head // n_kv_heads)
+
+
+        # 6. 注意力得分
+        scaling = head_dim ** -0.5
+        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) * scaling
+        
+        # 7. 应用注意力遮罩
+        mask_fill_value = torch.finfo(attn_weights.dtype).min
+        if attention_mask is not None:
+            padding_mask = ~(attention_mask.data.bool()).view(b, 1, 1, actual_seq_len)
+            attn_weights = attn_weights.masked_fill(padding_mask, mask_fill_value)
+
+        # 8. Softmax
+        attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+        
+        # 9. 应用于 V
+        attn_output = torch.matmul(attn_weights, value_states)
+
+        # 10. 输出 reshape 和投影
+        attn_output = attn_output.transpose(1, 2).contiguous()
+        attn_output = attn_output.reshape(b, tgt_s, h)
+        value = F.linear(attn_output, w_out.data) + residual
+
+        if donate[0]: inputs.delete()
+        if donate[1]: attention_mask.delete()
+
+        if compress_cache:
+            k_new = compute_device.compressed_device.compress(k_new_for_cache, comp_config)
+            v_new = compute_device.compressed_device.compress(v_new_for_cache, comp_config)
+        else:
+            k_new = TorchTensor.create_from_torch(k_new_for_cache, compute_device)
+            v_new = TorchTensor.create_from_torch(v_new_for_cache, compute_device)
+
+        return TorchTensor.create_from_torch(value, compute_device), k_new, v_new
+
+    def mlp(self, compute_device, inputs, w_gate, w_up, w_down, w_ln, donate):
+        """MLP with SwiGLU activation - LLaMA特有的激活函数"""
+        # decompress weights
+        if w_gate.device.device_type == DeviceType.COMPRESSED:
+            w_gate = w_gate.device.decompress(w_gate)
+            w_up = w_up.device.decompress(w_up)
+            w_down = w_down.device.decompress(w_down)
+
+        b, s, h = inputs.shape
+        
+        # Pre-normalization with RMSNorm
+        residual = inputs.data
+        out = self.rms_norm(inputs.data, w_ln.data)
+
+        
+        gate = F.linear(out, w_gate.data)
+        up = F.linear(out, w_up.data)       
+        silu_gate = F.silu(gate)  # SiLU activation
+        
+        intermediate = silu_gate * up  # Element-wise multiplication
+        
+        # Down projection
+        out = F.linear(intermediate, w_down.data)
+        
+        out = out + residual  # Residual connection
+
+        if donate[0]: inputs.delete()
+        return TorchTensor.create_from_torch(out, compute_device)
 
 # Llama 2 模型与 OPT 的主要区别:
 # 1. 位置编码: 使用旋转位置编码 (Rotary Positional Embedding, RoPE)，在 Attention 层中应用，而不是独立的输入层。
@@ -856,77 +458,26 @@ class LlamaModelComputation:
 # 3. MLP/FFN 层: 使用带 SiLU 激活函数的 SwiGLU，而不是带 ReLU 的标准 MLP。
 # 4. 注意力机制: 可能使用分组查询注意力 (Grouped-Query Attention, GQA) 来优化推理。
 
-class LlamaRMSNorm(BaseModelLayer):
-    """Llama 的 RMSNorm 层 (仅用于模型末尾的 final_norm)。"""
+class LLaMAInputEmbed(BaseModelLayer):
     def __init__(self, 
-                 config:FlexModelConfig, 
-                 env:ExecutionEnv, 
-                 policy:Policy, 
-                 weight_map:dict, 
-                 computation:LlamaModelComputation):
-        super().__init__(config, env, policy, weight_map=weight_map)
-        self.computation = computation # 待实现
-
+                 config: FlexModelConfig, 
+                 env: ExecutionEnv, 
+                 policy: Policy, 
+                 weight_map: dict, 
+                 computation: 'LlamaModelComputation'):
+        super().__init__(config, env, policy, weight_map=weight_map) 
+        self.computation = computation  
+        
     def init_weight(self, 
-                    weight_home:ValueHolder, 
-                    converted_path: str):
-        h = self.config.hidden_size
-        p = Path(converted_path)
-        weight_specs = [
-            ((h,), "final_norm_weight", p / self.weight_map["final_norm"][0], self.weight_map["final_norm"][1]),
-        ]
-        weights = init_weight_list(weight_specs, self.policy, self.env)
-        weight_home.store(weights)
-
-    def load_weight(self, 
-                    weight_home:ValueHolder, 
-                    weight_read_buf:ValueHolder, 
-                    k:List[Union[int, float]]):
-        (w_norm,) = weight_home.val
-        if k == 0:
-            dst = self.compute_device
-            weight_read_buf.store(w_norm.smart_copy(dst))
-
-    def forward(self, 
-                hidden, 
-                cache_read_buf:ValueHolder, 
-                weight_read_buf:ValueHolder, 
-                attention_mask:ValueHolder,
-                cache_write_buf:ValueHolder, 
-                i: List[Union[int, float]], 
-                k: List[Union[int, float]]):
-        
-        donate = [False] * 2
-        h, donate[0] = hidden.val, True
-        
-        if k == self.policy.num_gpu_batches - 1:
-            w_norm, donate[1] = weight_read_buf.pop()
-        else:
-            w_norm, _ = weight_read_buf.val
-        
-        h.data = self.computation.rms_norm(h.data, norm_weight=w_norm.data, eps=self.config.rms_norm_eps)
-        hidden.val = h
-
-
-class LlamaInputEmbed(BaseModelLayer):
-    """Llama 的输入嵌入层，只包含词嵌入。"""
-    def __init__(self, 
-                 config:FlexModelConfig, 
-                 env:ExecutionEnv, 
-                 policy:Policy, 
-                 weight_map:dict, 
-                 computation:LlamaModelComputation):
-        super().__init__(config, env, policy, weight_map=weight_map)
-        self.computation = computation # 待实现
-
-    def init_weight(self, 
-                    weight_home:ValueHolder, 
+                    weight_home: ValueHolder, 
                     converted_path: str):
         h = self.config.hidden_size
         v = self.config.vocab_size
         p = Path(converted_path)
         
+        # LLaMA 只有词嵌入，没有位置嵌入（使用RoPE）
         weight_specs = [
+            # ((v, h), "embed_tokens", p / self.weight_map["embed_tokens"][0], self.config.dtype),
             ((v, h), "embed_tokens", p / self.weight_map["embed_tokens"][0], self.weight_map["embed_tokens"][1]),
         ]
         
@@ -934,155 +485,168 @@ class LlamaInputEmbed(BaseModelLayer):
         weight_home.store(weights)
     
     def load_weight(self, 
-                    weight_home:ValueHolder, 
-                    weight_read_buf:ValueHolder, 
-                    k:List[Union[int, float]]):
+                    weight_home: ValueHolder, 
+                    weight_read_buf: ValueHolder, 
+                    k: List[Union[int, float]]):
         w_token, = weight_home.val
         if k == 0:
             dst = self.weight_load_dst
-            weight_read_buf.store(w_token.smart_copy(dst))
-    
+            weight_read_buf.store((w_token.smart_copy(dst),))
+
     def input_act_shape_and_dtype(self, batch_size, seq_len):
         return (batch_size, seq_len), np.int64
     
-
     def forward(self, 
                 hidden, 
-                cache_read_buf:ValueHolder, 
-                weight_read_buf:ValueHolder, 
-                attention_mask:ValueHolder,
-                cache_write_buf:ValueHolder, 
+                cache_read_buf: ValueHolder, 
+                weight_read_buf: ValueHolder, 
+                attention_mask: ValueHolder,
+                cache_write_buf: ValueHolder, 
                 i: List[Union[int, float]], 
                 k: List[Union[int, float]]):
-        
-        # TODO: 实现词嵌入的前向计算
+
         # Compute input embedding
         donate = [False] * 2
         h, donate[0] = hidden.val, True
 
         if k == self.policy.num_gpu_batches - 1:
-            # Clear the weight_read_buf if it is the last gpu batch
-            w_token, donate[1] = weight_read_buf.pop()
+            (w_token, donate[1]), = weight_read_buf.pop()
         else:
-            w_token, _ = weight_read_buf.val
+            (w_token, _), = weight_read_buf.val
 
         h = self.computation.input_embed(self.compute_device, h,
-            w_token, self.config.pad_token_id, donate)
+            w_token, getattr(self.config, "pad_token_id", self.config.bos_token_id), donate)
         hidden.val = h
 
-class LlamaOutputEmbed(BaseModelLayer):
-    """Llama 的输出层，将最终的 hidden states 映射到词汇表。"""
-    def __init__(self, 
-                 config:FlexModelConfig, 
-                 env:ExecutionEnv, 
-                 policy:Policy, 
-                 weight_map:dict, 
-                 computation:LlamaModelComputation):
-        super().__init__(config, env, policy, weight_map=weight_map)
-        self.computation = computation # 待实现
 
+
+class LLaMAOutputEmbed(BaseModelLayer):
+    def __init__(self, 
+                 config: FlexModelConfig, 
+                 env: ExecutionEnv, 
+                 policy: Policy, 
+                 weight_map: dict, 
+                 computation: 'LlamaModelComputation'):
+        super().__init__(config, env, policy, weight_map=weight_map)  
+        self.computation = computation 
+        
     def init_weight(self, 
-                    weight_home:ValueHolder, 
+                    weight_home: ValueHolder, 
                     converted_path: str):
         h = self.config.hidden_size
         v = self.config.vocab_size
         p = Path(converted_path)
         
+        # 输出层权重 - 使用RMSNorm和lm_head
         weight_specs = [
-            # 根据用户提供的字典，使用 "lm_head" 键
-            ((v, h), "lm_head", p / self.weight_map["lm_head"][0], self.weight_map["lm_head"][1]),
+            # ((h,), "final_norm_weight", p / "model.norm.weight", self.config.dtype),
+            # ((v, h), "lm_head", p / self.weight_map['lm_head'][0], self.config.dtype),  # 使用权重映射
+            ((h,), "final_norm_weight", p / self.weight_map['final_norm'][0], self.weight_map['final_norm'][1]),
+            ((v, h), "lm_head", p / self.weight_map['lm_head'][0], self.weight_map['lm_head'][1]),  # 使用权重映射
         ]
-        
+
         weights = init_weight_list(weight_specs, self.policy, self.env)
         weight_home.store(weights)
     
     def load_weight(self, 
-                    weight_home:ValueHolder, 
-                    weight_read_buf:ValueHolder, 
-                    k:List[Union[int, float]]):
-        (w_lm_head,) = weight_home.val
+                    weight_home: ValueHolder, 
+                    weight_read_buf: ValueHolder, 
+                    k: List[Union[int, float]]):
+        w_ln, w_token = weight_home.val
         if k == 0:
-            dst = self.weight_load_dst
-            weight_read_buf.store(w_lm_head.smart_copy(dst))
-
+            dst1 = self.weight_load_dst
+            dst2 = self.compute_device
+            weight_read_buf.store((w_ln.smart_copy(dst2), w_token.smart_copy(dst1)))
+    
     def input_act_shape_and_dtype(self, batch_size, seq_len):
         return (batch_size, seq_len, self.config.input_dim), self.config.dtype
 
     def forward(self, 
                 hidden, 
-                cache_read_buf:ValueHolder, 
-                weight_read_buf:ValueHolder, 
-                attention_mask:ValueHolder,
-                cache_write_buf:ValueHolder, 
+                cache_read_buf: ValueHolder, 
+                weight_read_buf: ValueHolder, 
+                attention_mask: ValueHolder,
+                cache_write_buf: ValueHolder, 
                 i: List[Union[int, float]], 
                 k: List[Union[int, float]]):
-        donate = [False] * 2
-        h, donate[0] = hidden.val, True
         
+        donate = [False] * 3
+        h, donate[0] = hidden.val, True
+
         if k == self.policy.num_gpu_batches - 1:
-            w_lm_head, donate[1] = weight_read_buf.pop()
+            (w_ln, donate[1]), (w_token, donate[2]) = weight_read_buf.pop()
         else:
-            w_lm_head, _ = weight_read_buf.val
-            
-        h, logits = self.computation.output_embed(self.compute_device, h, w_lm_head, donate,
+            (w_ln, _), (w_token, _) = weight_read_buf.val
+
+        h, logits = self.computation.output_embed(self.compute_device, h, w_ln, w_token, donate,
             self.task.do_sample, self.task.temperature)
         if self.task.logits:
             hidden.val = [h, logits]
         else:
             hidden.val = h
+        # print_stats(hidden.val.data, f"Layer Output embedding")
 
-class LlamaSelfAttention(BaseModelLayer):
-    """Llama 的自注意力层，包含 RoPE。"""
+
+class LLaMASelfAttention(BaseModelLayer):
     def __init__(self, 
-                 config:FlexModelConfig, 
-                 env:ExecutionEnv, 
-                 policy:Policy, 
-                 weight_map:dict, 
-                 computation:LlamaModelComputation):
-        super().__init__(config, env, policy, weight_map=weight_map)
+                 config: FlexModelConfig, 
+                 env: ExecutionEnv, 
+                 policy: Policy, 
+                 weight_map: dict, 
+                 computation: 'LlamaModelComputation', 
+                 ):
+        super().__init__(config, env, policy, weight_map=weight_map) 
         self.attention_compute = (self.env.cpu if self.policy.cpu_cache_compute
-            else self.env.gpu)
-        self.computation = computation
+            else self.env.gpu)  
+        self.computation = computation 
+
+        # LLaMA specific parameters
+        self.n_head = config.n_head
+        self.n_kv_heads = getattr(config, 'num_key_value_heads', self.n_head)
+        self.head_dim = config.hidden_size // self.n_head
         
-        self.h = self.config.hidden_size
-        self.num_heads = self.config.n_head
-        self.num_kv_heads = getattr(self.config, 'num_key_value_heads', self.num_heads)
-        self.head_dim = self.h // self.num_heads
-        self.kv_dim = self.num_kv_heads * self.head_dim
+        # Precompute RoPE frequencies
+        max_seq_len = getattr(config, "max_seq_len", None) or getattr(config, "max_position_embeddings", 2048)
+        self.freqs_cis = self.computation.precompute_freqs_cis(
+            self.head_dim, max_seq_len * 2
+        )
 
     def init_weight(self, 
-                    weight_home:ValueHolder, 
+                    weight_home: ValueHolder, 
                     converted_path: str):
-        
+        h = self.config.hidden_size
+        kv_dim = self.n_kv_heads * self.head_dim
         p = Path(converted_path)
         
         weight_specs = [
-            ((self.h, self.h), "atten_q_proj", p / self.weight_map["q_proj"][0], self.weight_map["q_proj"][1]),
-            ((self.kv_dim, self.h), "atten_k_proj", p / self.weight_map["k_proj"][0], self.weight_map["k_proj"][1]),
-            ((self.kv_dim, self.h), "atten_v_proj", p / self.weight_map["v_proj"][0], self.weight_map["v_proj"][1]),
-            ((self.h, self.h), "atten_o_proj", p / self.weight_map["o_proj"][0], self.weight_map["o_proj"][1]),
-            ((self.h,), "atten_norm", p / self.weight_map["norm"][0], self.weight_map["norm"][1]),
+            # Query projection
+            ((h, h), "attn_q_proj_weight", p / self.weight_map["q_proj"][0], self.weight_map["q_proj"][1]),
+            # Key projection (potentially smaller for GQA)
+            ((kv_dim, h), "attn_k_proj_weight", p / self.weight_map["k_proj"][0], self.weight_map["k_proj"][1]),
+            # Value projection (potentially smaller for GQA)
+            ((kv_dim, h), "attn_v_proj_weight", p / self.weight_map["v_proj"][0], self.weight_map["v_proj"][1]),
+            # Output projection
+            ((h, h), "attn_o_proj_weight", p / self.weight_map["o_proj"][0], self.weight_map["o_proj"][1]),
+            # RMSNorm weight (no bias)
+            ((h,), "attn_norm_weight", p / self.weight_map["norm"][0], self.weight_map["norm"][1]),
         ]
         weights = init_weight_list(weight_specs, self.policy, self.env)
         weight_home.store(weights)
     
     def load_weight(self, 
-                    weight_home:ValueHolder, 
-                    weight_read_buf:ValueHolder, 
-                    k:List[Union[int, float]]):
-        w_q, w_k, w_v, w_o, w_norm = weight_home.val
+                    weight_home: ValueHolder, 
+                    weight_read_buf: ValueHolder, 
+                    k: List[Union[int, float]]):
+        w_q, w_k, w_v, w_out, w_ln = weight_home.val
         if k == 0:
             dst1 = self.weight_load_dst
             dst2 = self.compute_device
             weight_read_buf.store((
-                w_q.smart_copy(dst1),
-                w_k.smart_copy(dst1),
-                w_v.smart_copy(dst1),
-                w_o.smart_copy(dst1),
-                w_norm.smart_copy(dst2),
-            ))
+                w_q.smart_copy(dst1), w_k.smart_copy(dst1),
+                w_v.smart_copy(dst1), w_out.smart_copy(dst1),
+                w_ln.smart_copy(dst2)))
     
-    def init_cache_one_gpu_batch(self, cache_home:ValueHolder):
+    def init_cache_one_gpu_batch(self, cache_home: ValueHolder):
         if self.policy.cache_gpu_percent == 100:
             device = self.env.gpu
         elif self.policy.cache_cpu_percent == 100:
@@ -1098,23 +662,13 @@ class LlamaSelfAttention(BaseModelLayer):
             assert device.device_type != DeviceType.MIXED
             device = device.compressed_device
 
-        
-        num_head, hidden_size, prompt_len, gen_len, gpu_batch_size = (
-            self.config.n_head, self.config.input_dim, self.task.prompt_len, self.task.gen_len,
-            self.policy.gpu_batch_size)
-        shape = (gpu_batch_size, prompt_len + gen_len - 1, num_head, hidden_size // num_head)
-        # NOTE: disable pin_memory due to high memory overhead
-        pin_memory = False
-        k_cache = device.allocate(shape, np.float16, pin_memory=pin_memory)
-        v_cache = device.allocate(shape, np.float16, pin_memory=pin_memory)
-        
-        cache_home.store((k_cache, v_cache))
-
-        
+        cache = device.init_cache_one_gpu_batch(self.config, self.task, self.policy)
+        cache_home.store(cache)
+    
     def load_cache(self, 
-                   cache_home:ValueHolder, 
-                   cache_read_buf:ValueHolder, 
-                   i:List[Union[int, float]]):
+                   cache_home: ValueHolder, 
+                   cache_read_buf: ValueHolder, 
+                   i: List[Union[int, float]]):
         if i == 0:  # prefill, no cache
             return
 
@@ -1136,17 +690,8 @@ class LlamaSelfAttention(BaseModelLayer):
             dst = self.attention_compute
 
         if path == 0:  # Direct copy
-            # shape: (b, s, n_head, head_dim)
-            indices = (
-                        slice(0, k_home.shape[0]),                         # 对应 b 维度，取所有元素
-                        slice(0, self.task.prompt_len + i),  # 对应 s 维度，从 0 到 task_prompt_len + i - 1
-                        slice(0, k_home.shape[2]),                         # 对应 n_head 维度，取所有元素
-                        slice(0, k_home.shape[3])                          # 对应 head_dim 维度，取所有元素
-                        ) 
-            # # shape: (s, b * n_head, head_dim)
-            # indices = (slice(0, self.task.prompt_len + i),
-            #            slice(0, k_home.shape[1]))
-
+            indices = (slice(0, self.task.prompt_len + i - 1),
+                       slice(0, k_home.shape[1]))
 
             if self.policy.attn_sparsity >= 1.0:
                 cache_read_buf.store((
@@ -1160,15 +705,8 @@ class LlamaSelfAttention(BaseModelLayer):
                 ))
         elif path == 1:  # Copy to CPU temporary workspace
             k_buf, v_buf = dst.next_attention_compute_workspace()
-            # shape: (b, s, n_head, head_dim)
-            indices = (
-                        slice(0, k_home.shape[0]),                         # 对应 b 维度，取所有元素
-                        slice(0, self.task.prompt_len + i),  # 对应 s 维度，从 0 到 task_prompt_len + i - 1
-                        slice(0, k_home.shape[2]),                         # 对应 n_head 维度，取所有元素
-                        slice(0, k_home.shape[3])                          # 对应 head_dim 维度，取所有元素
-                        ) 
-            # indices = (slice(0, self.task.prompt_len + i - 1),
-            #            slice(0, k_home.shape[1]))
+            indices = (slice(0, self.task.prompt_len + i - 1),
+                       slice(0, k_home.shape[1]))
             general_copy(k_buf, indices, k_home, indices)
 
             if self.policy.attn_sparsity >= 1.0:
@@ -1177,13 +715,9 @@ class LlamaSelfAttention(BaseModelLayer):
             else:
                 cache_read_buf.store(((k_buf, False), ((v_home, v_buf), False)))
         elif path == 2:  # Copy to both GPU and CPU
-            # The caches are stored on both GPU and other devices.
-            # Compute attention on gpu for caches stored on gpu.
-            # Compute attention on cpu for caches stored on cpu/disk.
             gpu_k_buf = k_home.data[0][0]
             gpu_v_buf = v_home.data[0][0]
 
-            # shape: (s, b * n_head, head_dim)
             k_buf, v_buf = dst.next_attention_compute_workspace()
             indices = (slice(0, self.task.prompt_len + i - 1),
                        slice(gpu_k_buf.shape[1], k_home.shape[1]))
@@ -1196,226 +730,208 @@ class LlamaSelfAttention(BaseModelLayer):
             raise ValueError(f"Invalid path: {path}")
         
     def store_cache(self, 
-                    cache_home:ValueHolder, 
-                    cache_write_buf:ValueHolder, 
-                    i:List[Union[int, float]]):
+                    cache_home: ValueHolder, 
+                    cache_write_buf: ValueHolder, 
+                    i: List[Union[int, float]]):
         k_home, v_home = cache_home.val
         k_new, v_new = cache_write_buf.pop()
 
-        if i == self.task.gen_len - 1:
+        if i == self.task.gen_len - 1:  # last token, no need to store cache
             return
 
         if i == 0:  # prefill
-            indices = (
-                        slice(0, k_new.shape[0]),                         # 对应 b 维度，取所有元素
-                        slice(0, self.task.prompt_len + i),  # 对应 s 维度，从 0 到 task_prompt_len + i - 1
-                        # slice(0, k_new.shape[2]),                         # 对应 n_head 维度，取所有元素
-                        # slice(0, k_new.shape[3])                          # 对应 head_dim 维度，取所有元素
-                        )     
-            # indices = (slice(0, k_new.shape[0]),
-            #            slice(0, k_new.shape[1]))
-            # print(f"k_new shape {k_new.shape}, \ndata is \n{k_new.data[0, 0]}")
-            # print(f"v_new shape {v_new.shape}, \ndata is \n{v_new.data[0, 0]}")     
+            indices = (slice(0, k_new.shape[0]),
+                       slice(0, k_new.shape[1]))
         else:  # decoding
             pos = self.task.prompt_len + i
-            # if i == 1:
-            #     print('===================Decodeing===========================')
-            #     print(f"pos is {pos}, copy shape is {pos-k_new.shape[1], pos}")
-            #     print(f"k_new shape {k_new.shape}, \ndata is \n{k_new.data[0, 0]}")
-            #     print(f"v_new shape {v_new.shape}, \ndata is \n{v_new.data[0, 0]}")
-            #     exit() 
-            # shape: (b, s, n_head, head_dim)
-            indices = (
-                        slice(0, k_new.shape[0]),                         # 对应 b 维度，取所有元素
-                        slice(pos - k_new.shape[1], pos),   # 对应 s 维度，取前 k_new.shape[2] 个元素
-                        # slice(None),                # 对应 n_head 维度，取所有元素
-                        # slice(None)                 # 对应 head_dim 维度，取所有元素
-                        )       
-            # indices = (slice(pos - k_new.shape[0], pos),
-            #            slice(0, k_new.shape[1]))   
+            indices = (slice(pos - k_new.shape[0], pos),
+                       slice(0, k_new.shape[1]))
 
         general_copy(k_home, indices, k_new, None)
         general_copy(v_home, indices, v_new, None)
-        
-        
+
+    def input_act_shape_and_dtype(self, batch_size, seq_len):
+        return (batch_size, seq_len, self.config.input_dim), np.float16
+
     def forward(self, 
                 hidden, 
-                cache_read_buf:ValueHolder, 
-                weight_read_buf:ValueHolder, 
-                attention_mask:ValueHolder,
-                cache_write_buf:ValueHolder, 
-                i:List[Union[int, float]], 
-                k:List[Union[int, float]]):
-        donate = [False] * 9
-        h, donate[0] = hidden.val, True
+                cache_read_buf: ValueHolder, 
+                weight_read_buf: ValueHolder, 
+                attention_mask: ValueHolder,
+                cache_write_buf: ValueHolder, 
+                i: List[Union[int, float]], 
+                k: List[Union[int, float]]):
         
-        if k == self.policy.num_gpu_batches - 1:
-            (w_q, donate[2]), (w_k, donate[3]), (w_v, donate[4]), (w_o, donate[5]), (w_norm, donate[6]) = weight_read_buf.pop()
-        else:
-            (w_q, _), (w_k, _), (w_v, _), (w_o, _), (w_norm, _) = weight_read_buf.val
+        donate = [False] * 14
+        h, donate[0] = hidden.val, True
 
-        if i == 0:
+        if k == self.policy.num_gpu_batches - 1:
+            ((w_q, donate[2]), (w_k, donate[3]), (w_v, donate[4]), 
+             (w_out, donate[5]), (w_ln, donate[6])) = weight_read_buf.pop()
+        else:
+            ((w_q, _), (w_k, _), (w_v, _), (w_out, _), (w_ln, _)) = weight_read_buf.val
+
+        # Get RoPE frequencies for current position
+        seq_len = h.shape[1]
+        start_pos = 0 if i == 0 else self.task.prompt_len + i - 1
+        # 确保freqs_cis在正确的设备上
+        freqs_cis = self.freqs_cis[start_pos:start_pos + seq_len]
+        if hasattr(h, 'device') and hasattr(h.device, 'dev'):
+            freqs_cis = freqs_cis.to(h.device.dev)
+        else:
+            freqs_cis = freqs_cis.to(h.device)
+
+        if i == 0:  # prefill
             mask, donate[1] = attention_mask.val.smart_copy(self.compute_device)
             h, new_k_cache, new_v_cache = self.computation.mha(
-                compute_device=self.compute_device, 
-                hidden_states=h, 
-                attention_mask=mask, w_q=w_q, w_k=w_k, w_v=w_v, w_o=w_o, w_norm=w_norm, 
-                n_head=self.config.n_head, config=self.config, donate=donate, 
-                compress_cache=self.policy.compress_cache, comp_config=self.policy.comp_cache_config, 
-                )
+                self.compute_device, h, mask, w_q, w_k, w_v, w_out, w_ln, 
+                self.n_head, self.n_kv_heads, freqs_cis, donate,
+                self.policy.compress_cache, self.policy.comp_cache_config)
             cache_write_buf.store((new_k_cache, new_v_cache))
-        else:
+        else:  # decoding
             mask, donate[1] = attention_mask.val.smart_copy(self.attention_compute)
             (k_cache, donate[7]), (v_cache, donate[8]) = cache_read_buf.pop()
             h, new_k_cache, new_v_cache = self.computation.mha_gen(
-                compute_device=self.compute_device, 
-                hidden_states=h, attention_mask=mask, 
-                w_q=w_q, w_k=w_k, w_v=w_v, w_o=w_o, w_norm=w_norm,
-                n_head=self.config.n_head, config=self.config, 
-                donate=donate, attn_sparsity=self.policy.attn_sparsity,compress_cache=self.policy.compress_cache, comp_config=self.policy.comp_cache_config, 
-                k_cache=k_cache, v_cache=v_cache
-                )
+                self.compute_device, h, mask, w_q, w_k, w_v, w_out, w_ln,
+                self.n_head, self.n_kv_heads, k_cache, v_cache, freqs_cis, donate,
+                self.policy.attn_sparsity, self.policy.compress_cache, self.policy.comp_cache_config)
             cache_write_buf.store((new_k_cache, new_v_cache))
-            
-        
+
         hidden.val = h
 
 
-class LlamaMLP(BaseModelLayer):
-    """Llama 的 MLP 层，使用 SwiGLU。"""
+class LLaMAMLP(BaseModelLayer):
     def __init__(self, 
-                 config:FlexModelConfig, 
-                 env:ExecutionEnv, 
-                 policy:Policy, 
-                 weight_map:dict, 
-                 computation:LlamaModelComputation):
-        super().__init__(config, env, policy, weight_map=weight_map)
-        self.computation = computation # 待实现
+                 config: FlexModelConfig, 
+                 env: ExecutionEnv, 
+                 policy: Policy, 
+                 weight_map: dict, 
+                 computation: 'LlamaModelComputation'):
+        super().__init__(config, env, policy, weight_map=weight_map) 
+        self.computation = computation
 
     def init_weight(self, 
-                    weight_home:ValueHolder, 
+                    weight_home: ValueHolder, 
                     converted_path: str):
         h = self.config.hidden_size
-        i = self.config.ffn_embed_dim
+        intermediate_size = getattr(self.config, 'intermediate_size', 4 * h)
         p = Path(converted_path)
-
+        
+        # LLaMA MLP has gate, up, down projections for SwiGLU
         weight_specs = [
-            ((i, h), "mlp_gate_proj", p / self.weight_map["gate_proj"][0], self.weight_map["gate_proj"][1]),
-            ((i, h), "mlp_up_proj", p / self.weight_map["up_proj"][0], self.weight_map["up_proj"][1]),
-            ((h, i), "mlp_down_proj", p / self.weight_map["down_proj"][0], self.weight_map["down_proj"][1]),
-            ((h,), "mlp_norm", p / self.weight_map["norm"][0], self.weight_map["norm"][1]),
+            ((intermediate_size, h), "mlp_gate_proj_weight", p / self.weight_map["gate_proj"][0], self.weight_map["gate_proj"][1]),
+            ((intermediate_size, h), "mlp_up_proj_weight", p / self.weight_map["up_proj"][0], self.weight_map["up_proj"][1]),
+            ((h, intermediate_size), "mlp_down_proj_weight", p / self.weight_map["down_proj"][0], self.weight_map["down_proj"][1]),
+            ((h,), "mlp_norm_weight", p / self.weight_map["norm"][0], self.weight_map["norm"][1]),
         ]
         weights = init_weight_list(weight_specs, self.policy, self.env)
         weight_home.store(weights)
 
     def load_weight(self, 
-                    weight_home:ValueHolder, 
-                    weight_read_buf:ValueHolder, 
-                    k:List[Union[int, float]]):
-        w_gate, w_up, w_down ,w_norm = weight_home.val
+                    weight_home: ValueHolder, 
+                    weight_read_buf: ValueHolder, 
+                    k: List[Union[int, float]]):
+        w_gate, w_up, w_down, w_ln = weight_home.val
         if k == 0:
             dst1 = self.weight_load_dst
             dst2 = self.compute_device
             weight_read_buf.store((
-                w_gate.smart_copy(dst1),
-                w_up.smart_copy(dst1),
-                w_down.smart_copy(dst1),
-                w_norm.smart_copy(dst2)
-            ))
+                w_gate.smart_copy(dst1), w_up.smart_copy(dst1),
+                w_down.smart_copy(dst1), w_ln.smart_copy(dst2)))
+    
+    def input_act_shape_and_dtype(self, batch_size, seq_len):
+        return (batch_size, seq_len, self.config.input_dim), np.float16
     
     def forward(self, 
                 hidden, 
-                cache_read_buf:ValueHolder, 
-                weight_read_buf:ValueHolder, 
-                attention_mask:ValueHolder,
-                cache_write_buf:ValueHolder, 
-                i:List[Union[int, float]], 
-                k:List[Union[int, float]]):
+                cache_read_buf: ValueHolder, 
+                weight_read_buf: ValueHolder, 
+                attention_mask: ValueHolder,
+                cache_write_buf: ValueHolder, 
+                i: List[Union[int, float]], 
+                k: List[Union[int, float]]):
+        
         donate = [False] * 5
         h, donate[0] = hidden.val, True
-        
+
         if k == self.policy.num_gpu_batches - 1:
-            (w_gate, donate[1]), (w_up, donate[2]), (w_down, donate[3]), (w_norm, donate[4]) = weight_read_buf.pop()
+            ((w_gate, donate[1]), (w_up, donate[2]), 
+             (w_down, donate[3]), (w_ln, donate[4])) = weight_read_buf.pop()
         else:
-            (w_gate, _), (w_up, _), (w_down, _), (w_norm, _), = weight_read_buf.val
-            
-        h = self.computation.mlp(self.compute_device, h, w_gate, w_up, w_down, w_norm, self.config, donate)
+            ((w_gate, _), (w_up, _), (w_down, _), (w_ln, _)) = weight_read_buf.val
+
+        h = self.computation.mlp(self.compute_device, h, w_gate, w_up, w_down, w_ln, donate)
         hidden.val = h
 
 
-class LlamaTransformerLayer(BaseTransformerLayer):
-    """Llama 的 Transformer 层。"""
+class LLaMATransformerLayer(BaseTransformerLayer):
     def __init__(self, 
-                 config:FlexModelConfig, 
-                 env:ExecutionEnv, 
-                 policy:Policy, 
+                 config: FlexModelConfig, 
+                 env: ExecutionEnv, 
+                 policy: Policy, 
                  weight_map: dict, 
-                 computation:LlamaModelComputation,  
-                 freqs_cis_table: Optional[torch.Tensor]=None):
+                 computation: 'LlamaModelComputation',):
         super().__init__(config, env, policy, weight_map)
-        self.computation = computation
-        self.attention = LlamaSelfAttention(config, env, policy, weight_map['attention'], self.computation)
-        self.mlp = LlamaMLP(config, env, policy, weight_map['mlp'], self.computation)
+        self.attention = LLaMASelfAttention(config=config, env=env, policy=policy, 
+                                           weight_map=weight_map['attention'], computation=computation)
+        self.mlp = LLaMAMLP(config=config, env=env, policy=policy, 
+                           weight_map=weight_map['mlp'], computation=computation)
 
-        self.freqs_cis_table = freqs_cis_table
-        
-        # self.attention_norm_weight = None
-        # self.ffn_norm_weight = None
-    def init_weight(self, weight_home, path):
-        home_attn, home_mlp = ValueHolder(), ValueHolder()
-        self.attention.init_weight(home_attn, path)
-        self.mlp.init_weight(home_mlp, path)
-        weight_home.store((home_attn, home_mlp))
+    def init_weight(self, 
+                    weight_home, 
+                    path):
+        home1, home2 = ValueHolder(), ValueHolder()
+        self.attention.init_weight(home1, path)
+        self.mlp.init_weight(home2, path)
+        weight_home.store((home1, home2))
     
-    def load_weight(self, weight_home:ValueHolder, weight_read_buf:ValueHolder, k:List[Union[int, float]]):
-        read_buf_attn, read_buf_mlp = ValueHolder(), ValueHolder()
-        (home_attn, home_mlp) = weight_home.val
-        
-        self.attention.load_weight(home_attn, read_buf_attn, k)
-        self.mlp.load_weight(home_mlp, read_buf_mlp, k)
-        
+    def load_weight(self, 
+                    weight_home: ValueHolder, 
+                    weight_read_buf: ValueHolder, 
+                    k: List[Union[int, float]]):
+        read_buf1, read_buf2 = ValueHolder(), ValueHolder()
+        home1, home2 = weight_home.val
+        self.attention.load_weight(home1, read_buf1, k)
+        self.mlp.load_weight(home2, read_buf2, k)
         if k == 0:
-            weight_read_buf.store((read_buf_attn, read_buf_mlp))
-    
-    def init_cache_one_gpu_batch(self, cache_home:ValueHolder):
+            weight_read_buf.store((read_buf1, read_buf2))
+
+    def init_cache_one_gpu_batch(self, cache_home: ValueHolder):
         self.attention.init_cache_one_gpu_batch(cache_home)
 
     def load_cache(self, 
-                   cache_home:ValueHolder, 
-                   cache_read_buf:ValueHolder, 
-                   i:List[Union[int, float]]):
+                   cache_home: ValueHolder, 
+                   cache_read_buf: ValueHolder, 
+                   i: List[Union[int, float]]):
         self.attention.load_cache(cache_home, cache_read_buf, i)
 
     def store_cache(self, 
-                    cache_home:ValueHolder, 
-                    cache_write_buf:ValueHolder, 
-                    i:List[Union[int, float]]):
+                    cache_home: ValueHolder, 
+                    cache_write_buf: ValueHolder, 
+                    i: List[Union[int, float]]):
         self.attention.store_cache(cache_home, cache_write_buf, i)
 
-
-    # def set_task(self, task):
-    #     self.task = task
-    
     def forward(self, 
                 hidden, 
-                cache_read_buf:ValueHolder, 
-                weight_read_buf:ValueHolder, 
-                attention_mask:ValueHolder,
-                cache_write_buf:ValueHolder, 
-                i:List[Union[int, float]], 
-                k:List[Union[int, float]]):
-        
+                cache_read_buf: ValueHolder, 
+                weight_read_buf: ValueHolder, 
+                attention_mask: ValueHolder,
+                cache_write_buf: ValueHolder, 
+                i: List[Union[int, float]], 
+                k: List[Union[int, float]]):
         if k == self.policy.num_gpu_batches - 1:
-            read_buf_attn, read_buf_mlp = weight_read_buf.pop()
+            read_buf1, read_buf2 = weight_read_buf.pop()
         else:
-            read_buf_attn, read_buf_mlp = weight_read_buf.val
+            read_buf1, read_buf2 = weight_read_buf.val
 
-        self.attention.forward(hidden, cache_read_buf, read_buf_attn, attention_mask,
+        self.attention.forward(hidden, cache_read_buf, read_buf1, attention_mask,
                                cache_write_buf, i, k)
-        self.mlp.forward(hidden, None, read_buf_mlp, attention_mask, None, i, k)
+        
+        self.mlp.forward(hidden, None, read_buf2, attention_mask, None, i, k)
 
 
-class LlamaModel(BaseModel):
+
+class LLaMAModel(BaseModel):
     def __init__(self, 
                  config:FlexModelConfig, 
                  env:ExecutionEnv, 
@@ -1425,37 +941,40 @@ class LlamaModel(BaseModel):
         super().__init__(config, env, policy, weight_map=weight_map, path=path) 
 
         self.computation = LlamaModelComputation()
-        self.start_pos = 0
-
-        s = getattr(self.config, "max_seq_len", None) or getattr(self.config, "max_position_embeddings", None)
-        # head_dim = config.hidden_size // config.n_head
-        # inv_freq = 1.0 / (10000.0 ** (torch.arange(0, head_dim, 2).float().cuda() / head_dim))
-        # self.freqs_cis = self.computation.precompute_freqs_cis(head_dim, s * 2, inv_freq)
-
-        self.layers.append(LlamaInputEmbed(self.config, self.env, self.policy, self.weight_map, self.computation))
-        for layer_id in range(self.config.num_hidden_layers):
-            self.layers.append(LlamaTransformerLayer(
-                                                    self.config, self.env, self.policy, 
-                                                    self.weight_map['layers'][layer_id], self.computation, 
-                                                    # self.freqs_cis
-                                                    ))
         
-        self.layers.append(LlamaRMSNorm(self.config, self.env, self.policy, self.weight_map, self.computation))
-        self.layers.append(LlamaOutputEmbed(self.config, self.env, self.policy, self.weight_map, self.computation))
+        # 初始化调试数据
+        self.debug_data = {}
+        self.computation.debug_data = self.debug_data
+        self.policy.sep_layer = False
+        # InputEmbed, TransformerLayer, OutputEmbed = get_model_architecture(self.config.model_type)
+        self.layers.append(LLaMAInputEmbed(self.config, self.env, self.policy, self.weight_map, self.computation))
+        for layer_id in range(self.config.num_hidden_layers):
+            if self.policy.sep_layer:
+                self.layers.append(LLaMASelfAttention(self.config, self.env, self.policy, self.weight_map['layers'][layer_id]['attention'], self.computation))
+                self.layers.append(LLaMAMLP(self.config, self.env, self.policy, self.weight_map['layers'][layer_id]['mlp'], self.computation))
+            else:
+                self.layers.append(LLaMATransformerLayer(self.config, self.env, self.policy, self.weight_map['layers'][layer_id], self.computation))
+        self.layers.append(LLaMAOutputEmbed(self.config, self.env, self.policy, self.weight_map, self.computation))
 
+
+        if self.policy.act_gpu_percent == 100:
+            self.act_home = self.env.gpu
+        elif self.policy.act_cpu_percent == 100:
+            self.act_home = self.env.cpu
+        elif self.policy.act_disk_percent == 100:
+            self.act_home = self.env.disk
+        elif self.policy.act_numa_percent == 100:
+            self.act_home = self.env.numa
+        else:
+            raise NotImplementedError()
 
         self.init_cache_area() # 初始化用于保存权重 激活 cache 的内存区域
 
         self.task = None
-
-        # Precompute rotary embedding frequencies
-        self.compute_device.rotary_emb_cis = self.computation.precompute_freqs_cis(
-            self.config.hidden_size // self.config.n_head,
-            s * 2,).cuda()
+        
         self.init_all_weights(flexgen_weight_path=self.path)
 
     def init_all_weights(self, flexgen_weight_path):
-        # self.weight_home = array_1d(self.num_layers, ValueHolder)
         for layer_id, layer in enumerate(self.layers):
-            # print(f"layer id is {layer_id+1}, {layer}")
             layer.init_weight(self.weight_home[layer_id], flexgen_weight_path)
+    

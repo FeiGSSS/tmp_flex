@@ -16,15 +16,14 @@ class FlexModelConfig:
     这个类的实例将包含运行一个特定模型所需的所有架构信息和权重命名规则。
     """
     # --- 尺寸参数 ---
-    input_dim: int
-    hidden_size: int
-    n_head: int
-    num_hidden_layers: int
-    vocab_size: int
-    num_key_value_heads: int  # 用于 GQA/MQA
-    rms_norm_eps: float
-    ffn_embed_dim: int
-    dtype: type 
+    input_dim: int = None
+    hidden_size: int = None
+    n_head: int = None
+    num_hidden_layers: int = None
+    vocab_size: int = None
+    num_key_value_heads: int = None     # 用于 GQA/MQA
+    rms_norm_eps: float = None
+    ffn_embed_dim: int = None
 
     # --- 架构定义 ---
     model_type: str # 'llama', 'opt', 'deepseek', etc.
@@ -103,8 +102,7 @@ class FlexModelConfigFactory:
                 n_head=config["num_attention_heads"],
                 num_hidden_layers=config["num_hidden_layers"],
                 ffn_embed_dim=config["intermediate_size"],
-                dtype=np.float32,
-                pad_token_id=getattr(config, "pad_token_id", None) or getattr(config, "eos_token_id", None), 
+                pad_token_id=config.get("pad_token_id") or config.get("eos_token_id"), 
                 
                 vocab_size=config["vocab_size"],
                 num_key_value_heads=config.get("num_key_value_heads", config["num_attention_heads"]),
@@ -135,11 +133,11 @@ class FlexModelConfigFactory:
                 hidden_size=config["hidden_size"],
                 n_head=config["num_attention_heads"],
                 num_hidden_layers=config["num_hidden_layers"],
+                pad_token_id=config.get("pad_token_id") or config.get("eos_token_id"), 
                 vocab_size=config["vocab_size"],
                 num_key_value_heads=config.get("num_key_value_heads", config["num_attention_heads"]),
                 rms_norm_eps=config.get("layer_norm_eps", 1e-5), # OPT uses layer_norm_eps
                 mlp_type='GELU-MLP',
-                dtype=np.float32,
                 normalization_type='LayerNorm',
                 positional_embedding_type='Absolute',
                 layer_name_map={

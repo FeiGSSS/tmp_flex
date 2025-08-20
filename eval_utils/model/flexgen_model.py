@@ -505,7 +505,7 @@ class flexgen_model(TemplateLM):
                 inps = inps.cpu()
                 timers("generate").reset()
                 _, logits = self.model.get_logits(inps)
-                # print(logits);exit()
+                # print(logits, "\n", logits.dtype);exit()
                 # print(f"logits are: {logits}, logits dtype: {logits.dtype}, logits shape: {logits.shape} \n =======*******")
                 # exit()
                 time_costs = timers("generate").costs
@@ -548,6 +548,7 @@ class flexgen_model(TemplateLM):
             cut_gen_len=self.cut_gen_len, 
             temperature=generation_kwargs.get("temperature") if getattr(generation_kwargs, "temperature", None) else 0.0,  
         )
+        # print(outputs);exit()
 
         # store data to calculate lantency and throughput
         time_costs = timers("generate").costs

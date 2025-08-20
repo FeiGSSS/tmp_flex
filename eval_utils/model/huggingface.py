@@ -981,6 +981,7 @@ class HFLM(TemplateLM):
             use_cache=True,
             **generation_kwargs,
         )
+        # print(outputs, outputs.shape);exit()
         timers("generate").stop()
         time_costs = timers("generate").costs
         num_prompts, prompt_len = context.shape
