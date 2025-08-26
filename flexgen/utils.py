@@ -38,14 +38,21 @@ str_to_dtype = {
     "torch.int64": torch.int64,
     "torch.uint8": torch.uint8,
     "bool": torch.bool,
+    "bfloat16": torch.bfloat16,
+    "float16": torch.float16,
+    "float32": torch.float32,
+    "int8": torch.int8,
+    "int32": torch.int32,
+    "int64": torch.int64,
+    "uint8": torch.uint8,
 
-    "np.float16": np.float16,
-    "np.float32": np.float32,
-    "np.int8": np.int8,
-    "np.int32": np.int32,
-    "np.int64": np.int64,
-    "np.uint8": np.uint8,
-    "bool": bool,
+    # "np.float16": np.float16,
+    # "np.float32": np.float32,
+    # "np.int8": np.int8,
+    # "np.int32": np.int32,
+    # "np.int64": np.int64,
+    # "np.uint8": np.uint8,
+    # "bool": bool,
 }
 
 

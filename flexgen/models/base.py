@@ -6,7 +6,8 @@ import torch
 from tqdm import tqdm
 
 from flexgen.utils import (ValueHolder, 
-                           array_1d, array_2d, array_3d, array_4d
+                           array_1d, array_2d, array_3d, array_4d, 
+                           str_to_dtype
                            )
 # from flexgen.compression import CompressionConfig
 from flexgen.timer import timers
@@ -268,12 +269,12 @@ class BaseModel:
             gpu_batch_size = self.policy.gpu_batch_size
             left, right = k * gpu_batch_size, (k + 1) * gpu_batch_size
             if i == 0:  # load from the input ids
-                val = dst.allocate((gpu_batch_size, self.task.prompt_len), np.int32)
-                val.load_from_np(self.output_ids[left:right, :self.task.prompt_len])
+                val = dst.allocate((gpu_batch_size, self.task.prompt_len), self.task.inputs[0].dtype)
+                val.load_from_torch(self.output_ids[left:right, :self.task.prompt_len])
             else:  # load from the last generated token
                 pos = self.task.prompt_len + i
-                val = dst.allocate((gpu_batch_size, 1), np.int32)
-                val.load_from_np(self.output_ids[left:right, pos-1:pos])
+                val = dst.allocate((gpu_batch_size, 1), self.task.inputs[0].dtype)
+                val.load_from_torch(self.output_ids[left:right, pos-1:pos])
         else:  # load from the last layer
             val = self.hidden[i][j-1][k].pop().move(dst)
         self.hidden[i][j][k].store(val)
@@ -293,13 +294,13 @@ class BaseModel:
         if j == self.num_layers - 1:  # store to output
             gpu_batch_size = self.policy.gpu_batch_size
             left, right = k * gpu_batch_size, (k + 1) * gpu_batch_size
-            # ids = self.hidden[i][j][k].pop().data.detach().cpu().numpy()
+            # ids = self.hidden[i][j][k].pop().data.detach()
             if self.task.logits:
                 ids, logits = self.hidden[i][j][k].pop()
-                logits = logits.data.detach().cpu().numpy()
-                ids = ids.data.detach().cpu().numpy()
+                logits = logits.data.detach()
+                ids = ids.data.detach()
             else:
-                ids = self.hidden[i][j][k].pop().data.detach().cpu().numpy()
+                ids = self.hidden[i][j][k].pop().data.detach()
                 logits = None
             pos = self.task.prompt_len + i
 
@@ -350,8 +351,8 @@ class BaseModel:
         attention_compute = (self.env.cpu if self.policy.cpu_cache_compute
             else self.env.gpu)
         val = attention_compute.allocate(
-            (self.policy.gpu_batch_size, self.task.prompt_len), bool)
-        val.load_from_np((input_ids != getattr(self.config, "pad_token_id", self.config.eos_token_id)))
+            (self.policy.gpu_batch_size, self.task.prompt_len), torch.bool)
+        val.load_from_torch((input_ids != getattr(self.config, "pad_token_id", self.config.eos_token_id)))
         self.attention_mask[k].store(val)
     
     # def load_weight(self, i, j, k, overlap=True):
@@ -507,7 +508,7 @@ class BaseModel:
                 self.sync()
             timers("generate").stop()
 
-            if self.task.stop and np.all(self.stopped):
+            if self.task.stop and torch.all(self.stopped):
                 break
 
     def generation_loop_overlap_multi_batch(self):
@@ -658,7 +659,7 @@ class BaseModel:
         self.execute_gen_len = task.cut_gen_len if task.cut_gen_len else task.gen_len
         
         # Output token ids
-        print(task.inputs, prompt_len, gen_len)
+        # print(task.inputs, prompt_len, gen_len)
         pad_token_id = getattr(self.config, "pad_token_id", None)
         if pad_token_id is None:
             pad_token_id = getattr(self.config, "bos_token_id", 0)
@@ -667,12 +668,18 @@ class BaseModel:
         if pad_token_id is None:
             pad_token_id = 0  # 最终fallback
         
-        self.output_ids = np.full((len(task.inputs), prompt_len + gen_len),
+        self.output_ids = torch.full((len(task.inputs), prompt_len + gen_len),
                                   pad_token_id,
-                                  dtype=np.int32)
-        self.stopped = np.zeros((len(task.inputs), 1), dtype=bool)
-        self.output_ids[:, :prompt_len] = np.asarray(task.inputs)
-        self.logits = np.zeros((len(task.inputs), prompt_len, self.config.vocab_size), dtype=np.float32)
+                                  dtype=task.inputs[0].dtype)
+        self.stopped = torch.zeros((len(task.inputs), 1), dtype=torch.bool)
+        # 确保 inputs 是张量格式
+        if isinstance(task.inputs, (tuple, list)):
+            # 如果是元组或列表，转换为张量
+            inputs_tensor = torch.stack([torch.tensor(x, dtype=self.output_ids.dtype) for x in task.inputs])
+        else:
+            inputs_tensor = task.inputs
+        self.output_ids[:, :prompt_len] = inputs_tensor
+        self.logits = torch.zeros((len(task.inputs), prompt_len, self.config.vocab_size), dtype=str_to_dtype[self.config.torch_dtype])
         # print(f"self.logits shape: {self.logits.shape}, {prompt_len}, {gen_len} \n =========***********");exit()
         
         # if len(task.inputs) != batch_size:
@@ -762,10 +769,17 @@ class BaseModel:
         if pad_token_id is None:
             pad_token_id = 0  # 最终fallback
             
-        self.output_ids = np.full((len(task.inputs), prompt_len + gen_len),
-            pad_token_id, dtype=np.int32)
-        self.stopped = np.zeros((len(task.inputs), 1), dtype=bool)
-        self.output_ids[:, :prompt_len] = np.asarray(task.inputs)
+        self.output_ids = torch.full((len(task.inputs), prompt_len + gen_len),
+            pad_token_id, dtype=task.inputs[0].dtype)
+        self.stopped = torch.zeros((len(task.inputs), 1), dtype=torch.bool)
+        # 确保 inputs 是张量格式
+        if isinstance(task.inputs, (tuple, list)):
+            # 如果是元组或列表，转换为张量
+            inputs_tensor = torch.stack([torch.tensor(x, dtype=self.output_ids.dtype) for x in task.inputs])
+        else:
+            inputs_tensor = task.inputs
+            
+        self.output_ids[:, :prompt_len] = inputs_tensor
         assert gpu_batch_size * num_gpu_batches == len(task.inputs)
 
         # Intermediate tensors

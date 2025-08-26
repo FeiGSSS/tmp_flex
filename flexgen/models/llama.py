@@ -107,11 +107,8 @@ class LlamaModelComputation:
 
         token_ids = inputs.data
         if donate[0]: inputs.delete()
-        # print(f"DEBUG: token_ids shape and dtype: {token_ids.shape}, {token_ids.dtype}")
         # token embedding
         token_embed = F.embedding(token_ids, w_token.data, pad_token_id)
-        # print(f"DEBUG: token_embed shape and dtype: {token_embed.shape}, {token_embed.dtype}")
-        # exit()
         return TorchTensor.create_from_torch(token_embed, compute_device)
 
     def output_embed(self, compute_device, inputs, w_ln, w_token, donate,
@@ -121,11 +118,6 @@ class LlamaModelComputation:
             w_token = w_token.device.decompress(w_token)
 
         b, s, h = inputs.shape
-        
-        # 调试隐藏状态
-        # print(f"DEBUG: 输入隐藏状态形状: {inputs.data.shape}")
-        # print(f"DEBUG: 输入隐藏状态范围: [{inputs.data.min().item():.4f}, {inputs.data.max().item():.4f}]")
-        # print(f"DEBUG: 输入隐藏状态均值: {inputs.data.mean().item():.4f}, 标准差: {inputs.data.std().item():.4f}")
         
         # 保存输入隐藏状态数据
         if hasattr(self, 'debug_data'):
@@ -139,19 +131,7 @@ class LlamaModelComputation:
         
         # RMSNorm instead of LayerNorm
         hidden = self.rms_norm(inputs.data, w_ln.data)
-        
-        # 调试RMSNorm后的隐藏状态
-        # print(f"DEBUG: RMSNorm后隐藏状态范围: [{hidden.min().item():.4f}, {hidden.max().item():.4f}]")
-        # print(f"DEBUG: RMSNorm后隐藏状态均值: {hidden.mean().item():.4f}, 标准差: {hidden.std().item():.4f}")
-        
-        # 保存RMSNorm后的隐藏状态数据
-        if hasattr(self, 'debug_data'):
-            self.debug_data['normalized_hidden_state'] = {
-                'range': [hidden.min().item(), hidden.max().item()],
-                'mean': hidden.mean().item(),
-                'std': hidden.std().item(),
-                'tensor': hidden.cpu().numpy()
-            }
+
         
         if donate[0]: inputs.delete()
 
@@ -159,69 +139,12 @@ class LlamaModelComputation:
         logits = F.linear(hidden, w_token.data)
         last_token_logits = logits[:,-1,:]
 
-        # 详细的调试信息
-        # print(f"DEBUG: Last token logits shape: {last_token_logits.shape}")
-        # print(f"DEBUG: do_sample={do_sample}, temperature={temperature}")
-        # print(f"DEBUG: Logits range: [{last_token_logits.min().item():.4f}, {last_token_logits.max().item():.4f}]")
-        # print(f"DEBUG: Logits mean: {last_token_logits.mean().item():.4f}, std: {last_token_logits.std().item():.4f}")
-        
-        # 保存logits数据
-        if hasattr(self, 'debug_data'):
-            self.debug_data['logits'] = {
-                'shape': list(logits.shape),
-                'range': [logits.min().item(), logits.max().item()],
-                'mean': logits.mean().item(),
-                'std': logits.std().item(),
-                'tensor': logits.cpu().numpy(),
-                'last_token_logits': {
-                    'shape': list(last_token_logits.shape),
-                    'range': [last_token_logits.min().item(), last_token_logits.max().item()],
-                    'mean': last_token_logits.mean().item(),
-                    'std': last_token_logits.std().item(),
-                    'tensor': last_token_logits.cpu().numpy()
-                }
-            }
-        
-        # 检查logits是否异常
-        if torch.isinf(last_token_logits).any() or torch.isnan(last_token_logits).any():
-            print(f"ERROR: Logits contains inf/nan!")
-            last_token_logits = torch.nan_to_num(last_token_logits, nan=0.0, posinf=100.0, neginf=-100.0)
-        
-        # 显示前10个最高的logits值和对应的token ID
-        top_logits, top_indices = torch.topk(last_token_logits[0], 10)
-        # print(f"DEBUG: Top 10 logits: {top_logits.tolist()}")
-        # print(f"DEBUG: Top 10 indices: {top_indices.tolist()}")
-        
-        # 保存top-k数据
-        if hasattr(self, 'debug_data'):
-            self.debug_data['top_k'] = {
-                'logits': top_logits.cpu().numpy(),
-                'indices': top_indices.cpu().numpy()
-            }
-
         if do_sample and not temperature < 1e-5:
             probs = torch.softmax(last_token_logits / temperature, dim=-1)
             ids = torch.multinomial(probs, num_samples=1)
         else:
             ids = last_token_logits.argmax(dim=1, keepdim=True)
         
-        # print(f"DEBUG: Generated token IDs: {ids.cpu().numpy()}")
-        # print(f"DEBUG: Generated token ID range: [{ids.min().item()}, {ids.max().item()}]")
-        
-        # 检查生成的token ID是否在合理范围内
-        vocab_size = w_token.data.shape[0]
-        if ids.max().item() >= vocab_size:
-            print(f"ERROR: Generated token ID {ids.max().item()} >= vocab_size {vocab_size}")
-        if ids.min().item() < 0:
-            print(f"ERROR: Generated token ID {ids.min().item()} < 0")
-        
-        # 检查是否总是生成相同的token（循环检测）
-        if hasattr(self, '_last_generated_id'):
-            if torch.equal(ids, self._last_generated_id):
-                print(f"WARNING: Generated same token as last time!")
-        self._last_generated_id = ids.clone()
-        
-        # print("="*60)
         
         return TorchTensor.create_from_torch(ids, compute_device), TorchTensor.create_from_torch(logits, compute_device)
 
@@ -584,7 +507,6 @@ class LLaMAOutputEmbed(BaseModelLayer):
             hidden.val = [h, logits]
         else:
             hidden.val = h
-        # print_stats(hidden.val.data, f"Layer Output embedding")
 
 
 class LLaMASelfAttention(BaseModelLayer):

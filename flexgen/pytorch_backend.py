@@ -14,7 +14,7 @@ import torch.nn.functional as F
 import numpy as np
 
 from flexgen.utils import (GB, T, cpu_mem_stats, vector_gather,
-    np_dtype_to_torch_dtype, torch_dtype_to_np_dtype,
+    str_to_dtype, np_dtype_to_torch_dtype, torch_dtype_to_np_dtype,
     torch_dtype_to_num_bytes)
 
 from flexgen.libnuma import libnuma
@@ -191,40 +191,41 @@ class TorchTensor:
             self.device.delete(self)
         self.device = self.data = None
 
-    def load_from_np(self, np_array):
+    def load_from_torch(self, torch_tensor):
         if self.device.device_type == DeviceType.DISK:
             with open(self.data, "wb") as fout:
-                np.save(fout, np_array)
+                torch.save(fout, torch_tensor)
         elif self.device.device_type == DeviceType.NUMA:
             ptr, byte_size, shape, dtype = self.data
-            assert np_array.flags.c_contiguous, "NUMA tensor must be C-contiguous"
-            memcopy.memmove(ptr, np_array.ctypes.data, byte_size)
+            assert torch_tensor.flags.c_contiguous, "NUMA tensor must be C-contiguous"
+            memcopy.memmove(ptr, torch_tensor.ctypes.data, byte_size)
         else:
             if self.device.device_type == DeviceType.COMPRESSED:
-                tmp = torch.from_numpy(np_array)
-                tmp = global_cpu_device.compressed_device.compress(tmp, self.data[2])
+                tmp = global_cpu_device.compressed_device.compress(torch_tensor, self.data[2])
                 general_copy(self, None, tmp, None)
             else:
-                self.data.copy_(torch.from_numpy(np_array))
+                self.data.copy_(torch_tensor)
 
-    def load_from_np_file(self, filename):
+    def load_from_torch_file(self, filename):
         if self.device.device_type == DeviceType.DISK:
             shutil.copy(filename, self.data)
         else:
-            self.load_from_np(np.load(filename))
+            self.load_from_torch(torch.load(filename))
 
     def copy(self, dst, src_indices=None):
         if src_indices:
             assert all(x.step is None for x in src_indices)
             shape = tuple(x.stop - x.start for x in src_indices
                 ) + self.shape[len(src_indices):]
+            # shape = torch.tensor(tuple(x.stop - x.start for x in src_indices
+            # ) + self.shape[len(src_indices):])
         else:
             shape = self.shape
 
         if dst.device_type == DeviceType.COMPRESSED:
-            ret = dst.allocate(shape, torch_dtype_to_np_dtype[self.dtype], self.data[2])
+            ret = dst.allocate(shape, self.dtype, self.data[2])
         else:
-            ret = dst.allocate(shape, torch_dtype_to_np_dtype[self.dtype])
+            ret = dst.allocate(shape, self.dtype)
         general_copy(ret, None, self, src_indices)
         return ret
 
@@ -258,14 +259,14 @@ class TorchNuma:
         Allocate a tensor on a NUMA node.
         """
         name = name or TorchTensor.next_name()
-        byte_size = np.prod(shape) * torch_dtype_to_num_bytes[np_dtype_to_torch_dtype[dtype]]
+        byte_size = torch.prod(shape) * torch_dtype_to_num_bytes[str_to_dtype[dtype]]
         ptr = libnuma.alloc_onnode(byte_size, self.numa_node)
         if ptr is None:
             raise MemoryError(f"Failed to allocate {byte_size} bytes on NUMA node {self.numa_node}")
         self._metadata[name] = (ptr, byte_size, shape, dtype)
         
         return TorchTensor(shape,
-                           np_dtype_to_torch_dtype[dtype],
+                           dtype, 
                            (ptr, byte_size, shape, dtype),
                            self,
                            name=name)
@@ -290,8 +291,9 @@ class TorchNuma:
         batch_size = policy.gpu_batch_size
         
         shape = (prompt_len + gen_len - 1, batch_size * n_head, hidden_size // n_head)
-        k_cache = self.allocate(shape, np.float16)
-        v_cache = self.allocate(shape, np.float16)
+        # shape = torch.tensor((prompt_len + gen_len - 1, batch_size * n_head, hidden_size // n_head))
+        k_cache = self.allocate(shape, config.torch_dtype)
+        v_cache = self.allocate(shape, config.torch_dtype)
         return k_cache, v_cache
     
     def mem_stats(self):
@@ -340,7 +342,6 @@ class TorchDevice:
             pin_memory = True if pin_memory is None else pin_memory
         else:
             pin_memory = False
-        dtype = np_dtype_to_torch_dtype[dtype]
         data = torch.empty(shape, dtype=dtype, pin_memory=pin_memory, device=self.dev)
         return TorchTensor.create_from_torch(data, self, name=name)
 
@@ -363,8 +364,9 @@ class TorchDevice:
             # so we only need one workspace instead of two.
             for i in range(1 if policy.sep_layer else 2):
                 shape = (max_seq_len, b * n_head, head_dim)
-                k_cache = self.allocate(shape, np.float16, pin_memory=False)
-                v_cache = self.allocate(shape, np.float16, pin_memory=False)
+                # shape = torch.tensor((max_seq_len, b * n_head, head_dim))
+                k_cache = self.allocate(shape, str_to_dtype[config.torch_dtype], pin_memory=False)
+                v_cache = self.allocate(shape, str_to_dtype[config.torch_dtype], pin_memory=False)
                 self.attention_compute_workspace.append((k_cache, v_cache))
         else:
             self.compressed_device.init_attention_compute_workspace(
@@ -398,8 +400,8 @@ class TorchDevice:
         shape = (prompt_len + gen_len - 1, gpu_batch_size * num_head, hidden_size // num_head)
         # NOTE: disable pin_memory due to high memory overhead
         pin_memory = False
-        k_cache = self.allocate(shape, np.float16, pin_memory=pin_memory)
-        v_cache = self.allocate(shape, np.float16, pin_memory=pin_memory)
+        k_cache = self.allocate(shape, str_to_dtype[config.torch_dtype], pin_memory=pin_memory)
+        v_cache = self.allocate(shape, str_to_dtype[config.torch_dtype], pin_memory=pin_memory)
         return k_cache, v_cache
 
 
@@ -477,7 +479,7 @@ class TorchDisk:
         name = name or TorchTensor.next_name()
         path = os.path.join(self.path, name)
         np.lib.format.open_memmap(path, mode="w+", shape=shape, dtype=dtype)
-        return TorchTensor(shape, np_dtype_to_torch_dtype[dtype],
+        return TorchTensor(shape, dtype, # TODO
                            path, self, name=name)
 
     def delete(self, tensor):
@@ -489,8 +491,8 @@ class TorchDisk:
             config.n_head, config.input_dim, task.prompt_len, task.gen_len,
             policy.gpu_batch_size)
         shape = (prompt_len + gen_len - 1, gpu_batch_size * num_head, hidden_size // num_head)
-        k_cache = self.allocate(shape, np.float16)
-        v_cache = self.allocate(shape, np.float16)
+        k_cache = self.allocate(shape, str_to_dtype[config.torch_dtype])
+        v_cache = self.allocate(shape, str_to_dtype[config.torch_dtype])
         return k_cache, v_cache
 
     def submit_copy(self, *args):
@@ -543,11 +545,11 @@ class TorchMixedDevice:
             if seg_len == 0:
                 tensors.append(None)
             else:
-                seg_shape = shape[:SEG_DIM] + (seg_len,) + shape[SEG_DIM+1:]
+                seg_shape = (shape[:SEG_DIM] + (seg_len,) + shape[SEG_DIM+1:])
                 tensors.append(devices[i].allocate(seg_shape, dtype,
                     pin_memory=pin_memory))
 
-        return TorchTensor(shape, np_dtype_to_torch_dtype[dtype],
+        return TorchTensor(shape, dtype, # TODO
                            (tensors, seg_points), self, name=name)
 
     def delete(self, tensor):
@@ -573,9 +575,9 @@ class TorchMixedDevice:
         lens = [len_gpu, len_cpu, len_disk]
 
         pin_memory = False
-        k_cache = self.allocate(shape, np.float16,
+        k_cache = self.allocate(shape, str_to_dtype[config.torch_dtype],
             seg_lengths=lens, pin_memory=pin_memory)
-        v_cache = self.allocate(shape, np.float16,
+        v_cache = self.allocate(shape, str_to_dtype[config.torch_dtype],
             seg_lengths=lens, pin_memory=pin_memory)
         return k_cache, v_cache
 

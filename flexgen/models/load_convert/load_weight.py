@@ -11,7 +11,7 @@ from flexgen.models.load_convert.convert_weights import convert # 导入转换�
 
 class AutoFlexModel:
     @staticmethod
-    def from_pretrained(model_path: str, force_convert: bool = False):
+    def from_pretrained(model_path: str, force_convert: bool = False, save_prefix: str = None):
         """
         统一加载入口。自动处理转换和加载。
         
@@ -24,7 +24,10 @@ class AutoFlexModel:
         # 定义转换后权重的存放路径
         model_name = Path(model_path).name.replace(".gguf", "")
         # 将转换后的文件存放在原模型目录的子文件夹中
-        converted_path = Path(model_path) / f"{model_name}-flexgen-np"
+        if save_prefix is None:
+            converted_path = Path(model_path) / f"{model_name}-flexgen"
+        else:
+            converted_path = Path(model_path) / f"{model_name}-flexgen-{save_prefix}"
         
         # 1. 检查是否已转换，如果未转换或强制转换，则执行
         config_path = converted_path / "flexgen_config.pkl"

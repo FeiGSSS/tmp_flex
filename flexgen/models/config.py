@@ -36,6 +36,7 @@ class FlexModelConfig:
     # 使用 {i} 作为层号的占位符
     layer_name_map: Dict[str, str]
     pad_token_id: int = None
+    # kvcache_dtype: str = None
     def __init__(self, **kwargs):
             # 1. 先检查并设置所有显式定义的核心字段
             required_fields = [field.name for field in dataclasses.fields(self)]
@@ -93,8 +94,8 @@ class FlexModelConfigFactory:
         # 不要硬编码pad_token_id，让它从原始配置中获取
         # filtered_config['pad_token_id'] = 0
 
-        # LLaMA, DeepSeek, Qwen2 等现代模型架构高度相似
-        if model_type in ["llama", "deepseek", "qwen2", "mistral"]:
+        # LLaMA
+        if model_type in ["llama", "qwen2"]:
             return FlexModelConfig(
                 input_dim=config["hidden_size"],
                 model_type=model_type,
@@ -103,7 +104,8 @@ class FlexModelConfigFactory:
                 num_hidden_layers=config["num_hidden_layers"],
                 ffn_embed_dim=config["intermediate_size"],
                 pad_token_id=config.get("pad_token_id") or config.get("eos_token_id"), 
-                
+                # kvcache_dtype=config.get("torch_dtype", "float16"),
+
                 vocab_size=config["vocab_size"],
                 num_key_value_heads=config.get("num_key_value_heads", config["num_attention_heads"]),
                 rms_norm_eps=config["rms_norm_eps"],
@@ -156,6 +158,63 @@ class FlexModelConfigFactory:
                 }, 
                 **filtered_config,
             )
+        # DeepSeek-v2
+        elif model_type == "deepseek_v2":
+            return FlexModelConfig(
+                input_dim=config["hidden_size"],
+                model_type=model_type,
+                hidden_size=config["hidden_size"],
+                n_head=config["num_attention_heads"],
+                num_hidden_layers=config["num_hidden_layers"],
+                pad_token_id=config.get("pad_token_id") or config.get("eos_token_id"), 
+                vocab_size=config["vocab_size"],
+                num_key_value_heads=config.get("num_key_value_heads", config["num_attention_heads"]),
+                rms_norm_eps=config.get("rms_norm_eps", 1e-6),
+                mlp_type='Gated-SwiGLU',
+                normalization_type='RMSNorm',
+                positional_embedding_type='Rotary',
+                layer_name_map = {
+                    # 全局权重
+                    "embed_tokens": "model.embed_tokens.weight",
+                    "lm_head": "lm_head.weight",  # lm_head 通常位于顶层，没有'model.'前缀
+                    "final_norm": "model.norm.weight",
+
+                    # 每层的 LayerNorm
+                    "attn_norm": "model.layers.{i}.input_layernorm.weight",
+                    "mlp_norm": "model.layers.{i}.post_attention_layernorm.weight",
+
+                    # 每层的 Attention 权重 (根据模型输出精确匹配)
+                    "attn_q_proj": "model.layers.{i}.self_attn.q_proj.weight",
+                    "attn_kv_a_proj": "model.layers.{i}.self_attn.kv_a_proj_with_mqa.weight",
+                    "attn_kv_a_norm": "model.layers.{i}.self_attn.kv_a_layernorm.weight",
+                    "attn_kv_b_proj": "model.layers.{i}.self_attn.kv_b_proj.weight",
+                    "attn_o_proj": "model.layers.{i}.self_attn.o_proj.weight",
+
+                    # === 标准 MLP 权重 (仅用于第 0 层) ===
+                    # 脚本会在 i=0 时查找这些权重
+                    "mlp_gate_proj": "model.layers.{i}.mlp.gate_proj.weight",
+                    "mlp_up_proj": "model.layers.{i}.mlp.up_proj.weight",
+                    "mlp_down_proj": "model.layers.{i}.mlp.down_proj.weight",
+
+                    # === MoE 权重 (用于第 1-26 层) ===
+                    # 脚本会在 i > 0 时查找这些权重
+                    # MoE 路由器/门控
+                    "mlp_gate": "model.layers.{i}.mlp.gate.weight",
+
+                    # 共享专家 (Shared Experts)
+                    "mlp_shared_gate_proj": "model.layers.{i}.mlp.shared_experts.gate_proj.weight",
+                    "mlp_shared_up_proj": "model.layers.{i}.mlp.shared_experts.up_proj.weight",
+                    "mlp_shared_down_proj": "model.layers.{i}.mlp.shared_experts.down_proj.weight",
+
+                    # 独立专家 (Individual Experts) - 需要 {j} 占位符
+                    "mlp_experts_gate_proj": "model.layers.{i}.mlp.experts.{j}.gate_proj.weight",
+                    "mlp_experts_up_proj": "model.layers.{i}.mlp.experts.{j}.up_proj.weight",
+                    "mlp_experts_down_proj": "model.layers.{i}.mlp.experts.{j}.down_proj.weight",
+                }, 
+                **filtered_config,
+            )
+        
+        
         elif model_type == "chatglm":
             # ChatGLM (v2/v3) 的实现细节（如QueryKeyValuen一体的权重）需要特别处理
             # 此处为简化示例，实际需要更复杂的映射和后端计算支持

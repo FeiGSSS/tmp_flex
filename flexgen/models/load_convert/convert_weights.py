@@ -61,25 +61,24 @@ def load_state_dict_and_config(model_path: str):
     
     raise FileNotFoundError(f"No valid model files (.bin, .safetensors, .gguf) found in {model_path}")
 
-def save_param_as_numpy(param, output_dir, flexgen_name, data_dtype):
+def save_param(param, output_dir, flexgen_name, data_dtype):
     """将张量保存为NumPy格式"""
     # GGUF 张量已经是 numpy, PyTorch 张量需要转换
     # print(param.dtype)
     param_path = Path(output_dir) / flexgen_name
     data_dtype[flexgen_name] = str(param.dtype)
-    if isinstance(param, torch.Tensor):
-        if param.dtype == torch.bfloat16:
-            # print(param.dtype)
-            param = param.type(torch.float32)
-        param_np = param.cpu().detach().numpy()
-    else:
-        param_np = param
+    # if isinstance(param, torch.Tensor):
+    #     if param.dtype == torch.bfloat16:
+    #         # print(param.dtype)
+    #         param = param.type(torch.float32)
+    #     param_np = param.cpu().detach().numpy()
+    # else:
+    #     param_np = param
 
     # # FlexGen的权重通常是FP16
     # if param_np.dtype != np.float32:
     #     param_np = param_np.astype(np.float32)
-    with open(param_path, "wb") as f:
-        np.save(f, param_np)
+    torch.save(param, param_path)
 
     # param_path = Path(output_dir) / flexgen_name
     # with open(param_path, "wb") as f:
@@ -112,7 +111,7 @@ def convert(model_path: str, output_path: str):
     data_dtype = {}
     for raw_name, param in tqdm(state_dict.items(), desc="Converting Tensors"):
 
-        save_param_as_numpy(param, output_path, raw_name, data_dtype)
+        save_param(param, output_path, raw_name, data_dtype)
             # shared embedding
         # if "embed_tokens.weight" in raw_name:
         #     shutil.copy(output_path, output_path.replace(
@@ -131,17 +130,45 @@ def convert(model_path: str, output_path: str):
         # 检查是否是层内权重 (包含占位符 {i})
         if "{i}" in raw_name_template:
             for i in range(config.num_hidden_layers):
-                # 生成具体的原始权重名
-                raw_name = raw_name_template.format(i=i)
-                # 确认这个权重确实存在
-                if raw_name in state_dict:
-                    component = 'attention' if 'attn' in flexgen_name_template else 'mlp'
-                    standard_name = flexgen_name_template.split('_', 1)[1]
-                    # 在清单中记录此权重的原始文件名
-                    if raw_name.replace('weight', 'bias') in state_dict:
-                        weight_map['layers'][i][component][standard_name] = [raw_name, raw_name.replace('weight', 'bias'), data_dtype[raw_name], data_dtype[raw_name.replace('weight', 'bias')]]
-                    else:
-                        weight_map['layers'][i][component][standard_name] = [raw_name, data_dtype[raw_name]]
+                # 新增：检查新是否存在专家占位符 {j}
+                if "{j}" in raw_name_template:
+                    num_experts = getattr(config, "num_local_experts", 64) 
+                    for j in range(num_experts):
+                        raw_name = raw_name_template.format(i=i, j=j)
+                        if raw_name in state_dict:
+                            component = 'mlp'
+                            standard_name = f"experts.{j}." + flexgen_name_template.split('_', 2)[2]
+                            
+                            # 检查是否存在 bias
+                            if raw_name.replace('weight', 'bias') in state_dict:
+                                weight_map['layers'][i][component][standard_name] = [raw_name, raw_name.replace('weight', 'bias'), data_dtype[raw_name], data_dtype[raw_name.replace('weight', 'bias')]]
+                            else:
+                                weight_map['layers'][i][component][standard_name] = [raw_name, data_dtype[raw_name]]
+                else:
+                    # 非 MoE 层处理逻辑
+                    raw_name = raw_name_template.format(i=i)
+                    if raw_name in state_dict:
+                        component = 'attention' if 'attn' in flexgen_name_template else 'mlp'
+                        standard_name = flexgen_name_template.split('_', 1)[1]
+                        
+                        if raw_name.replace('weight', 'bias') in state_dict:
+                            weight_map['layers'][i][component][standard_name] = [raw_name, raw_name.replace('weight', 'bias'), data_dtype[raw_name], data_dtype[raw_name.replace('weight', 'bias')]]
+                        else:
+                            weight_map['layers'][i][component][standard_name] = [raw_name, data_dtype[raw_name]]
+
+                
+                
+                # # 生成具体的原始权重名
+                # raw_name = raw_name_template.format(i=i)
+                # # 确认这个权重确实存在
+                # if raw_name in state_dict:
+                #     component = 'attention' if 'attn' in flexgen_name_template else 'mlp'
+                #     standard_name = flexgen_name_template.split('_', 1)[1]
+                #     # 在清单中记录此权重的原始文件名
+                #     if raw_name.replace('weight', 'bias') in state_dict:
+                #         weight_map['layers'][i][component][standard_name] = [raw_name, raw_name.replace('weight', 'bias'), data_dtype[raw_name], data_dtype[raw_name.replace('weight', 'bias')]]
+                #     else:
+                #         weight_map['layers'][i][component][standard_name] = [raw_name, data_dtype[raw_name]]
         else: # 处理非循环/全局权重
             raw_name = raw_name_template
             if raw_name in state_dict:

@@ -73,6 +73,8 @@ def add_parser_arguments(parser:argparse.ArgumentParser):
         const=True, default=True)
     parser.add_argument("--force_convert", default=False, action="store_true",
         help="Whether to force convert the model weights.")
+    parser.add_argument("--save_prefix", default=None, type=str,
+    help="Whether to force convert the model weights.")
 
 
 
@@ -138,7 +140,7 @@ def run_flexgen(args):
     assert not (args.compress_cache and args.attn_sparsity < 1.0), "Not implemented"
 
     print("init weight...")
-    model_config, converted_path, weight_map = AutoFlexModel.from_pretrained(args.path, force_convert=args.force_convert)
+    model_config, converted_path, weight_map = AutoFlexModel.from_pretrained(args.path, force_convert=args.force_convert, save_prefix=args.save_prefix)
     model_config: FlexModelConfig
     converted_path: str
     weight_map: dict
