@@ -10,7 +10,8 @@ import torch
 import numpy as np
 
 from flexgen.utils import (
-    GB, vector_gather, str_to_dtype, torch_dtype_to_num_bytes
+    GB, vector_gather, str_to_dtype, torch_dtype_to_num_bytes,
+    torch_dtype_to_np_dtype
     )
                            
 from flexgen.numa_tensor import NumaTensor, add_numa_methods, numa_ops
@@ -293,7 +294,8 @@ class TorchDisk:
     def allocate(self, shape, dtype, pin_memory=None, name=None):
         name = name or TorchTensor.next_name()
         path = os.path.join(self.path, name)
-        np.lib.format.open_memmap(path, mode="w+", shape=shape, dtype=dtype)
+        np.lib.format.open_memmap(path, mode="w+", shape=shape,
+                                  dtype=torch_dtype_to_np_dtype[dtype])
         return TorchTensor(shape, dtype, path, self, name=name)
 
     def delete(self, tensor):
