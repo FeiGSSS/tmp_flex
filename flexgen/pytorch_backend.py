@@ -407,7 +407,7 @@ def copy_worker_func(queue, cuda_id):
             elif src_data.dtype == torch.bfloat16:
                 cpu_buf = cpu_buf_bf16
             else:
-                raise NotSupportedErr()
+                raise NotImplementedError()
 
             if (src.device.device.startswith('cuda') or
                 dst.device.device.startswith('cuda')):
