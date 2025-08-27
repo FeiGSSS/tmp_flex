@@ -9,7 +9,6 @@ from flexgen.utils import (ValueHolder,
                            array_1d, array_2d, array_3d, array_4d, 
                            str_to_dtype
                            )
-# from flexgen.compression import CompressionConfig
 from flexgen.timer import timers
 from flexgen.models.config import FlexModelConfig
 from flexgen.models.utils import ExecutionEnv, Policy, Task
@@ -34,8 +33,7 @@ class BaseModelLayer:
         self.policy = policy
         self.weight_map = weight_map
         self.compute_device = self.env.gpu
-        self.weight_load_dst = (self.compute_device.compressed_device if policy.compress_weight
-            else self.compute_device)
+        self.weight_load_dst = self.compute_device
         self.task = None
 
     def set_task(self, task):
@@ -675,7 +673,8 @@ class BaseModel:
         # 确保 inputs 是张量格式
         if isinstance(task.inputs, (tuple, list)):
             # 如果是元组或列表，转换为张量
-            inputs_tensor = torch.stack([torch.tensor(x, dtype=self.output_ids.dtype) for x in task.inputs])
+            # inputs_tensor = torch.stack([torch.tensor(x, dtype=self.output_ids.dtype) for x in task.inputs])
+            inputs_tensor = torch.stack(task.inputs).to(self.output_ids.dtype)
         else:
             inputs_tensor = task.inputs
         self.output_ids[:, :prompt_len] = inputs_tensor
@@ -775,7 +774,8 @@ class BaseModel:
         # 确保 inputs 是张量格式
         if isinstance(task.inputs, (tuple, list)):
             # 如果是元组或列表，转换为张量
-            inputs_tensor = torch.stack([torch.tensor(x, dtype=self.output_ids.dtype) for x in task.inputs])
+            # inputs_tensor = torch.stack([torch.tensor(x, dtype=self.output_ids.dtype) for x in task.inputs])
+            inputs_tensor = torch.stack(task.inputs).to(self.output_ids.dtype)
         else:
             inputs_tensor = task.inputs
             

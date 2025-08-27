@@ -14,8 +14,7 @@ from flexgen.models.utils import (ExecutionEnv, Task, Policy,
                            )
 from flexgen.models.config import FlexModelConfig
 # from flexgen.flex_model import Policy
-from flexgen.pytorch_backend import (TorchDevice, TorchDisk, TorchLink, TorchNuma, TorchTensor, 
-    TorchMixedDevice, DeviceType, general_copy, fix_recursive_import)
+from flexgen.pytorch_backend import (TorchTensor, TorchDevice, general_copy, fix_recursive_import)
 
 # from flex_model import init_weight_list, ValueHolder
 fix_recursive_import()
@@ -102,8 +101,6 @@ class LlamaModelComputation:
 
     def input_embed(self, compute_device, inputs, w_token, pad_token_id, donate):
         """输入嵌入层 - LLaMA只有token embedding，没有position embedding"""
-        if w_token.device.device_type == DeviceType.COMPRESSED:
-            w_token = w_token.device.decompress(w_token)
 
         token_ids = inputs.data
         if donate[0]: inputs.delete()
@@ -114,8 +111,6 @@ class LlamaModelComputation:
     def output_embed(self, compute_device, inputs, w_ln, w_token, donate,
                      do_sample, temperature):
         """输出嵌入层 - 使用RMSNorm"""
-        if w_token.device.device_type == DeviceType.COMPRESSED:
-            w_token = w_token.device.decompress(w_token)
 
         b, s, h = inputs.shape
         
@@ -150,7 +145,7 @@ class LlamaModelComputation:
 
     
     def mha(self, compute_device, inputs, attention_mask, w_q, w_k, w_v, w_out, w_ln,
-        n_head, n_kv_heads, freqs_cis, donate, compress_cache, comp_config):
+        n_head, n_kv_heads, freqs_cis, donate, compress_cache=False, comp_config=False):
         """
         mha 的最终调试版本，会打印每一步的中间结果。
         """
@@ -237,12 +232,10 @@ class LlamaModelComputation:
 
     def mha_gen(self, compute_device, inputs, attention_mask, w_q, w_k, w_v, w_out, w_ln,
             n_head, n_kv_heads, k_cache, v_cache, freqs_cis, donate,
-            attn_sparsity, compress_cache, comp_config):
+            attn_sparsity, compress_cache=False, comp_config=False):
         """
         Multi-head attention (decoding phase) - Final corrected version for K/V cache shaping.
         """
-        if w_q.device.device_type == DeviceType.COMPRESSED:
-            w_q, w_k, w_v, w_out = [w.device.decompress(w) for w in [w_q, w_k, w_v, w_out]]
 
         b, tgt_s, h = inputs.shape
         src_s = attention_mask.shape[1]
@@ -348,11 +341,6 @@ class LlamaModelComputation:
 
     def mlp(self, compute_device, inputs, w_gate, w_up, w_down, w_ln, donate):
         """MLP with SwiGLU activation - LLaMA特有的激活函数"""
-        # decompress weights
-        if w_gate.device.device_type == DeviceType.COMPRESSED:
-            w_gate = w_gate.device.decompress(w_gate)
-            w_up = w_up.device.decompress(w_up)
-            w_down = w_down.device.decompress(w_down)
 
         b, s, h = inputs.shape
         
@@ -575,14 +563,11 @@ class LLaMASelfAttention(BaseModelLayer):
             device = self.env.cpu
         elif self.policy.cache_disk_percent == 100:
             device = self.env.disk
-        elif self.policy.cache_numa_percent == 100:
-            device = self.env.numa
+        elif self.policy.cache_cxl_percent == 100:
+            device = self.env.cxl
         else:
             raise NotImplementedError()
 
-        if self.policy.compress_cache:
-            assert device.device_type != DeviceType.MIXED
-            device = device.compressed_device
 
         cache = device.init_cache_one_gpu_batch(self.config, self.task, self.policy)
         cache_home.store(cache)
@@ -597,19 +582,8 @@ class LLaMASelfAttention(BaseModelLayer):
         k_home, v_home = cache_home.val
 
         # Pick code path
-        if self.policy.compress_cache:
-            path = 0
-            dst = self.attention_compute.compressed_device
-        else:
-            if self.policy.cpu_cache_compute:
-                if (k_home.device.device_type == DeviceType.MIXED and
-                    k_home.data[0][0] is not None):
-                    path = 2
-                else:
-                    path = 1
-            else:
-                path = 0
-            dst = self.attention_compute
+        path = 0
+        dst = self.attention_compute
 
         if path == 0:  # Direct copy
             indices = (slice(0, self.task.prompt_len + i - 1),
@@ -698,17 +672,25 @@ class LLaMASelfAttention(BaseModelLayer):
         start_pos = 0 if i == 0 else self.task.prompt_len + i - 1
         # 确保freqs_cis在正确的设备上
         freqs_cis = self.freqs_cis[start_pos:start_pos + seq_len]
-        if hasattr(h, 'device') and hasattr(h.device, 'dev'):
-            freqs_cis = freqs_cis.to(h.device.dev)
+        # if hasattr(h, 'device') and hasattr(h.device, 'dev'):
+        #     freqs_cis = freqs_cis.to(h.device.dev)
+        # else:
+        #     freqs_cis = freqs_cis.to(h.device)
+        
+        assert isinstance(h, TorchTensor)
+        assert isinstance(h.device, TorchDevice)
+        device = h.device.device
+        if not device.startswith('cuda'):
+            freqs_cis = freqs_cis.to_numa(h.device.device)
         else:
-            freqs_cis = freqs_cis.to(h.device)
+            freqs_cis = freqs_cis.to(device)
+        
 
         if i == 0:  # prefill
             mask, donate[1] = attention_mask.val.smart_copy(self.compute_device)
             h, new_k_cache, new_v_cache = self.computation.mha(
                 self.compute_device, h, mask, w_q, w_k, w_v, w_out, w_ln, 
-                self.n_head, self.n_kv_heads, freqs_cis, donate,
-                self.policy.compress_cache, self.policy.comp_cache_config)
+                self.n_head, self.n_kv_heads, freqs_cis, donate)
             cache_write_buf.store((new_k_cache, new_v_cache))
         else:  # decoding
             mask, donate[1] = attention_mask.val.smart_copy(self.attention_compute)
@@ -716,7 +698,7 @@ class LLaMASelfAttention(BaseModelLayer):
             h, new_k_cache, new_v_cache = self.computation.mha_gen(
                 self.compute_device, h, mask, w_q, w_k, w_v, w_out, w_ln,
                 self.n_head, self.n_kv_heads, k_cache, v_cache, freqs_cis, donate,
-                self.policy.attn_sparsity, self.policy.compress_cache, self.policy.comp_cache_config)
+                self.policy.attn_sparsity)
             cache_write_buf.store((new_k_cache, new_v_cache))
 
         hidden.val = h
@@ -885,8 +867,8 @@ class LLaMAModel(BaseModel):
             self.act_home = self.env.cpu
         elif self.policy.act_disk_percent == 100:
             self.act_home = self.env.disk
-        elif self.policy.act_numa_percent == 100:
-            self.act_home = self.env.numa
+        elif self.policy.act_cxl_percent == 100:
+            self.act_home = self.env.cxl
         else:
             raise NotImplementedError()
 

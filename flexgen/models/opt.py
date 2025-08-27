@@ -5,15 +5,12 @@ import torch.nn.functional as F
 from typing import Any, Union, List
 
 from flexgen.models.base import BaseModelLayer, BaseTransformerLayer, BaseModel
-from flexgen.utils import (ValueHolder, 
-                           array_1d, array_2d, array_3d, array_4d)
-from flexgen.models.utils import (ExecutionEnv, Task, Policy, 
-                                  init_weight_list, get_weight_tuple
+from flexgen.utils import (ValueHolder)
+from flexgen.models.utils import (ExecutionEnv, Policy, init_weight_list
                            )
 from flexgen.models.config import FlexModelConfig
 # from flexgen.flex_model import Policy
-from flexgen.pytorch_backend import (TorchDevice, TorchDisk, TorchLink, TorchNuma, TorchTensor, 
-    TorchMixedDevice, DeviceType, general_copy, fix_recursive_import)
+from flexgen.pytorch_backend import (TorchTensor, general_copy, fix_recursive_import)
 
 # from flex_model import init_weight_list, ValueHolder
 fix_recursive_import()
@@ -24,10 +21,6 @@ class OPTModelComputation:
     此类封装了所有原先在 pytorch_backend.py 中为 OPT 模型定义的计算逻辑。
     """
     def input_embed(self, compute_device, inputs, attention_mask, w_token, w_pos, pad_token_id, donate):
-        # decompress weights
-        if w_token.device.device_type == DeviceType.COMPRESSED:
-            w_token = w_token.device.decompress(w_token)
-            w_pos = w_pos.device.decompress(w_pos)
 
         token_ids = inputs.data
         mask = attention_mask.data
@@ -51,9 +44,6 @@ class OPTModelComputation:
 
     def output_embed(self, compute_device, inputs, w_ln, b_ln, w_token, donate,
                          do_sample, temperature):
-        # decompress weights
-        if w_token.device.device_type == DeviceType.COMPRESSED:
-            w_token = w_token.device.decompress(w_token)
 
         b, s, h = inputs.shape
 
@@ -170,14 +160,8 @@ class OPTModelComputation:
         return value
 
     def mha(self, compute_device, inputs, attention_mask, w_q, b_q, w_k, b_k, w_v, b_v,
-            w_out, b_out, w_ln, b_ln, n_head, donate, compress_cache, comp_config):
+            w_out, b_out, w_ln, b_ln, n_head, donate, compress_cache=False, comp_config=False):
         """Multi-head attention (prefill phase)."""
-        # decompress weights
-        if w_q.device.device_type == DeviceType.COMPRESSED:
-            w_q = w_q.device.decompress(w_q)
-            w_k = w_k.device.decompress(w_k)
-            w_v = w_v.device.decompress(w_v)
-            w_out = w_out.device.decompress(w_out)
 
         b, s, h = inputs.shape
         head_dim = h // n_head
@@ -240,14 +224,8 @@ class OPTModelComputation:
 
     def mha_gen(self, compute_device, inputs, attention_mask, w_q, b_q, w_k, b_k, w_v, b_v,
                 w_out, b_out, w_ln, b_ln, n_head, k_cache, v_cache, donate,
-                attn_sparsity, compress_cache, comp_config):
+                attn_sparsity, compress_cache=False, comp_config=False):
         """Multi-head attention (decoding phase)."""
-        # decompress weights
-        if w_q.device.device_type == DeviceType.COMPRESSED:
-            w_q = w_q.device.decompress(w_q)
-            w_k = w_k.device.decompress(w_k)
-            w_v = w_v.device.decompress(w_v)
-            w_out = w_out.device.decompress(w_out)
 
         b, tgt_s, h = inputs.shape
         src_s = attention_mask.shape[1]
@@ -343,10 +321,6 @@ class OPTModelComputation:
         return TorchTensor.create_from_torch(value, compute_device), k_new, v_new
 
     def mlp(self, compute_device, inputs, wi, bi, wo, bo, w_ln, b_ln, donate):
-        # decompress weights
-        if wi.device.device_type == DeviceType.COMPRESSED:
-            wi = wi.device.decompress(wi)
-            wo = wo.device.decompress(wo)
 
         b, s, h = inputs.shape
 
@@ -551,10 +525,6 @@ class OPTSelfAttention(BaseModelLayer):
         else:
             raise NotImplementedError()
 
-        if self.policy.compress_cache:
-            assert device.device_type != DeviceType.MIXED
-            device = device.compressed_device
-
         cache = device.init_cache_one_gpu_batch(self.config, self.task, self.policy)
         cache_home.store(cache)
     
@@ -568,19 +538,8 @@ class OPTSelfAttention(BaseModelLayer):
         k_home, v_home = cache_home.val
 
         # Pick code path
-        if self.policy.compress_cache:
-            path = 0
-            dst = self.attention_compute.compressed_device
-        else:
-            if self.policy.cpu_cache_compute:
-                if (k_home.device.device_type == DeviceType.MIXED and
-                    k_home.data[0][0] is not None):
-                    path = 2
-                else:
-                    path = 1
-            else:
-                path = 0
-            dst = self.attention_compute
+        path = 0
+        dst = self.attention_compute
 
         if path == 0:  # Direct copy
             # shape: (s, b * n_head, head_dim)
@@ -597,34 +556,6 @@ class OPTSelfAttention(BaseModelLayer):
                     k_home.smart_copy(dst, indices),
                     (v_home, False),
                 ))
-        elif path == 1:  # Copy to CPU temporary workspace
-            # shape: (s, b * n_head, head_dim)
-            k_buf, v_buf = dst.next_attention_compute_workspace()
-            indices = (slice(0, self.task.prompt_len + i - 1),
-                       slice(0, k_home.shape[1]))
-            general_copy(k_buf, indices, k_home, indices)
-
-            if self.policy.attn_sparsity >= 1.0:
-                general_copy(v_buf, indices, v_home, indices)
-                cache_read_buf.store(((k_buf, False), (v_buf, False)))
-            else:
-                cache_read_buf.store(((k_buf, False), ((v_home, v_buf), False)))
-        elif path == 2:  # Copy to both GPU and CPU
-            # The caches are stored on both GPU and other devices.
-            # Compute attention on gpu for caches stored on gpu.
-            # Compute attention on cpu for caches stored on cpu/disk.
-            gpu_k_buf = k_home.data[0][0]
-            gpu_v_buf = v_home.data[0][0]
-
-            # shape: (s, b * n_head, head_dim)
-            k_buf, v_buf = dst.next_attention_compute_workspace()
-            indices = (slice(0, self.task.prompt_len + i - 1),
-                       slice(gpu_k_buf.shape[1], k_home.shape[1]))
-            general_copy(k_buf, indices, k_home, indices)
-            general_copy(v_buf, indices, v_home, indices)
-            cache_read_buf.store((((gpu_k_buf, k_buf,), False),
-                                  ((gpu_v_buf, v_buf,), False)))
-            assert self.policy.attn_sparsity >= 1.0
         else:
             raise ValueError(f"Invalid path: {path}")
         
@@ -685,16 +616,14 @@ class OPTSelfAttention(BaseModelLayer):
             # print(f'========================')
             mask, donate[1] = attention_mask.val.smart_copy(self.compute_device)
             h, new_k_cache, new_v_cache = self.computation.mha(self.compute_device, h, mask, w_q, b_q,
-                w_k, b_k, w_v, b_v, w_out, b_out, w_ln, b_ln, n_head, donate,
-                self.policy.compress_cache, self.policy.comp_cache_config)
+                w_k, b_k, w_v, b_v, w_out, b_out, w_ln, b_ln, n_head, donate)
             cache_write_buf.store((new_k_cache, new_v_cache))
         else:  # decoding
             mask, donate[1] = attention_mask.val.smart_copy(self.attention_compute)
             (k_cache, donate[12]), (v_cache, donate[13]) = cache_read_buf.pop()
             h, new_k_cache, new_v_cache = self.computation.mha_gen(self.compute_device, h, mask, w_q,
                 b_q, w_k, b_k, w_v, b_v, w_out, b_out, w_ln, b_ln, n_head,
-                k_cache, v_cache, donate, self.policy.attn_sparsity,
-                self.policy.compress_cache, self.policy.comp_cache_config)
+                k_cache, v_cache, donate, self.policy.attn_sparsity)
             cache_write_buf.store((new_k_cache, new_v_cache))
 
         hidden.val = h

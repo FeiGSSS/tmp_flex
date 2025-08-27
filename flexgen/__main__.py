@@ -1,25 +1,13 @@
 import argparse
-import dataclasses
-import os
-import pickle as pkl
-import time
-from typing import Union, List, Optional
-from pathlib import Path
-
-import numpy as np
-from tqdm import tqdm
 import torch
-from transformers import AutoTokenizer
 
 from flexgen.models import get_model_architecture
 from flexgen.models.load_convert.load_weight import AutoFlexModel
 from flexgen.models.utils import Policy, ExecutionEnv, get_tokenizer
-from flexgen.pytorch_backend import (TorchDevice, TorchTensor, TorchDisk, TorchNuma, TorchMixedDevice, 
-                                     fix_recursive_import, print_memory_copy_stats)
+from flexgen.pytorch_backend import (TorchDevice, TorchDisk, fix_recursive_import)
 from flexgen.utils import (str2bool, project_decode_latency, write_benchmark_log, get_filename,  
                            DUMMY_WEIGHT, GB) 
 from flexgen.models.config import FlexModelConfig
-from flexgen.compression import CompressionConfig
 from flexgen.timer import timers
 
 
@@ -42,17 +30,17 @@ def add_parser_arguments(parser:argparse.ArgumentParser):
     parser.add_argument("--gpu-batch-size", type=int, default=2)
     parser.add_argument("--num-gpu-batches", type=int, default=1)
     parser.add_argument("--percent", nargs="+", type=int,
-        default=[100, 0, 0, 100, 0, 0, 100, 0, 0],
+        default=[100, 0, 0, 0, 0, 100, 100, 0, 0],
         help="Nine numbers. They are "
          "the percentage of weight on GPU, "
          "the percentage of weight on CPU, "
-         "the percentage of weight on NUMA, "
+         "the percentage of weight on CXL, "
          "the percentage of attention cache on GPU, "
          "the percentage of attention cache on CPU, "
-         "the percentage of attention cache on NUMA, "
+         "the percentage of attention cache on CXL, "
          "the percentage of activations on GPU, "
          "the percentage of activations on CPU, "
-         "the percentage of activations on NUMA")
+         "the percentage of activations on CXL")
     parser.add_argument("--sep-layer", type=str2bool, nargs='?',
         const=True, default=True)
     parser.add_argument("--pin-weight", type=str2bool, nargs="?",
@@ -94,13 +82,13 @@ def get_test_inputs(prompt_len, num_prompts, tokenizer):
                           truncation=True,
                           return_tensors="pt")
     
-    # 打印每个prompt的tokenized结果
-    print("=== Tokenization Results ===")
-    for i, prompt in enumerate(prompts):
-        print(f"Prompt {i+1}: {prompt[:100]}...")
-        print(f"Tokenized {i+1}: {input_ids.input_ids[i]}")
-        print(f"Length {i+1}: {len(input_ids.input_ids[i])}")
-        print("---")
+    # # 打印每个prompt的tokenized结果
+    # print("=== Tokenization Results ===")
+    # for i, prompt in enumerate(prompts):
+    #     print(f"Prompt {i+1}: {prompt[:100]}...")
+    #     print(f"Tokenized {i+1}: {input_ids.input_ids[i]}")
+    #     print(f"Length {i+1}: {len(input_ids.input_ids[i])}")
+    #     print("---")
     
     # 返回两个prompt的tokenized结果，而不是重复第一个
     return tuple(input_ids.input_ids)
@@ -121,22 +109,16 @@ def run_flexgen(args):
 
     gpu = TorchDevice("cuda:0")
     cpu = TorchDevice("cpu")
+    cxl = TorchDevice("cxl")
     disk = TorchDisk(args.offload_dir)
-    numa = TorchNuma()
-    env = ExecutionEnv(gpu=gpu, cpu=cpu, disk=disk, numa=numa, mixed=TorchMixedDevice([gpu, cpu, disk]))
+    env = ExecutionEnv(gpu=gpu, cpu=cpu, disk=disk, cxl=cxl)
 
     policy = Policy(args.gpu_batch_size, args.num_gpu_batches,
                     args.percent[0], args.percent[1], args.percent[2],
                     args.percent[3], args.percent[4], args.percent[5],
                     args.percent[6], args.percent[7], args.percent[8],
                     args.overlap, args.sep_layer, args.pin_weight,
-                    args.cpu_cache_compute, args.attn_sparsity,
-                    args.compress_weight,
-                    CompressionConfig(num_bits=4, group_size=64,
-                                      group_dim=0, symmetric=False),
-                    args.compress_cache,
-                    CompressionConfig(num_bits=4, group_size=64,
-                                      group_dim=2, symmetric=False))
+                    args.cpu_cache_compute, args.attn_sparsity)
     assert not (args.compress_cache and args.attn_sparsity < 1.0), "Not implemented"
 
     print("init weight...")
@@ -158,12 +140,12 @@ def run_flexgen(args):
     # tokenizer = AutoTokenizer.from_pretrained(args.path)
     warmup_inputs = get_test_inputs(32, num_prompts, tokenizer)
     inputs = get_test_inputs(prompt_len, num_prompts, tokenizer)
-    print('=========================')
-    print(f"inputs: {inputs}")
-    print(f"tranformers inputs is: [ 1, 3681, 338, 278, 7483, 4272, 310]")
+    # print('=========================')
+    # print(f"inputs: {inputs}")
+    # print(f"tranformers inputs is: [ 1, 3681, 338, 278, 7483, 4272, 310]")
     # is_equal = inputs == ([ 1, 3681, 338, 278, 7483, 4272, 310], )
     # print(f"inputs and transformers inputs id is_equal: {is_equal}")
-    print('=========================')
+    # print('=========================')
 
     print("load weight...")
     model = get_model_architecture(config=model_config, path=converted_path, policy=policy, env=env, weight_map=weight_map)
@@ -180,7 +162,7 @@ def run_flexgen(args):
         output_ids = model.generate(
             inputs, max_new_tokens=args.gen_len,
             debug_mode=args.debug_mode, cut_gen_len=cut_gen_len, verbose=args.verbose)
-        print(f"output_ids: {output_ids}")
+        # print(f"output_ids: {output_ids}")
         costs = timers("generate").costs
     finally:
         env.close_copy_threads()
@@ -210,6 +192,7 @@ def run_flexgen(args):
 
     gpu.print_stats()
     cpu.print_stats()
+    cxl.print_stats()
     projected = bool(args.debug_mode or cut_gen_len)
 
     if args.log_file == "auto":
@@ -221,10 +204,6 @@ def run_flexgen(args):
         model_config.model_bytes(), cache_size, hidden_size,
         gpu_peak_mem, projected, prefill_latency, prefill_throughput,
         decode_latency, decode_throughput, total_latency, total_throughput)
-    # if args.verbose >= 1:
-    #     print(log_str)
-    
-    print_memory_copy_stats()
 
 
 if __name__ == "__main__":

@@ -6,7 +6,6 @@ from transformers import AutoTokenizer, PreTrainedTokenizer, PreTrainedTokenizer
 
 
 from flexgen.utils import str_to_dtype, torch_dtype_to_np_dtype, np_dtype_to_torch_dtype, DUMMY_WEIGHT, GB
-from flexgen.compression import CompressionConfig
 
 # DUMMY_WEIGHT = "_DUMMY_"  # Use dummy weights for benchmark purposes
 
@@ -19,13 +18,13 @@ class Policy:
     # percent = a means a%
     w_gpu_percent: float
     w_cpu_percent: float
-    w_numa_percent: float
+    w_cxl_percent: float
     cache_gpu_percent: float
     cache_cpu_percent: float
-    cache_numa_percent: float
+    cache_cxl_percent: float
     act_gpu_percent: float
     act_cpu_percent: float
-    act_numa_percent: float
+    act_cxl_percent: float
 
     # Whether to overlap the I/O and compute
     overlap: bool
@@ -41,26 +40,18 @@ class Policy:
 
     # Sparsity of attention weights
     attn_sparsity: float
-
-    # Compress weights with group-wise quantization
-    compress_weight: bool
-    comp_weight_config: CompressionConfig
-
-    # Compress KV cache with group-wise quantization
-    compress_cache: bool
-    comp_cache_config: CompressionConfig
-
+    
     @property
     def w_disk_percent(self):
-        return 100 - self.w_gpu_percent - self.w_cpu_percent - self.w_numa_percent
+        return 100 - self.w_gpu_percent - self.w_cpu_percent - self.w_cxl_percent
 
     @property
     def cache_disk_percent(self):
-        return 100 - self.cache_gpu_percent - self.cache_cpu_percent - self.cache_numa_percent
+        return 100 - self.cache_gpu_percent - self.cache_cpu_percent - self.cache_cxl_percent
 
     @property
     def act_disk_percent(self):
-        return 100 - self.act_gpu_percent - self.act_cpu_percent - self.act_numa_percent
+        return 100 - self.act_gpu_percent - self.act_cpu_percent - self.act_cxl_percent
 
 
 @dataclasses.dataclass(frozen=True)
@@ -84,18 +75,7 @@ class ExecutionEnv:
     gpu: Any = None
     cpu: Any = None
     disk: Any = None
-    mixed: Any = None
-    numa: Any = None
-
-    # @classmethod
-    # def create(cls, offload_dir):
-    #     # fix recursive import
-    #     from flexgen.pytorch_backend import TorchDevice, TorchDisk, TorchMixedDevice
-    #     gpu = TorchDevice("cuda:0")
-    #     cpu = TorchDevice("cpu")
-    #     disk = TorchDisk(offload_dir)
-    #     numa = TorchDevice("numa")
-    #     return cls(gpu=gpu, cpu=cpu, disk=disk, mixed=TorchMixedDevice([gpu, cpu, disk]), numa=numa)
+    cxl: Any = None
 
     def close_copy_threads(self):
         self.disk.close_copy_threads()
@@ -199,8 +179,8 @@ def get_choice(cur_percent, percents, choices):
 
 
 def init_weight_list(weight_specs, policy, env):
-    dev_percents = [policy.w_disk_percent, policy.w_cpu_percent, policy.w_gpu_percent, policy.w_numa_percent]
-    dev_choices = [env.disk, env.cpu, env.gpu, env.numa]
+    dev_percents = [policy.w_disk_percent, policy.w_cpu_percent, policy.w_gpu_percent, policy.w_cxl_percent]
+    dev_choices = [env.disk, env.cpu, env.gpu, env.cxl]
 
     sizes = [np.prod(spec[0]) for spec in weight_specs]
     sizes_cumsum = np.cumsum(sizes)
@@ -221,7 +201,7 @@ def init_weight_list(weight_specs, policy, env):
             compress = False
         else:
             pin_memory = policy.pin_weight
-            compress = policy.compress_weight
+            compress = False
 
         if not compress:
             dtype = str_to_dtype[dtype]
