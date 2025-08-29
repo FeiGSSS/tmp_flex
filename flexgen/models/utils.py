@@ -190,42 +190,22 @@ def init_weight_list(weight_specs, policy, env):
         mid_percent = (sizes_cumsum[i] - sizes[i] / 2) / sizes_cumsum[-1]
         home = get_choice(mid_percent * 100, dev_percents, dev_choices)
         shape, name, filename, dtype = weight_specs[i]
-        # if isinstance(dtype, str):
-        #     dtype, flag = str_to_dtype[dtype], 1
-        # else:
-        #     dtype, flag = np_dtype_to_torch_dtype[dtype], 0
-        # dtype, flag= str_to_dtype[dtype], 1 if isinstance(dtype, str) else dtype
 
         if len(shape) < 2:
             pin_memory = True
-            compress = False
         else:
             pin_memory = policy.pin_weight
-            compress = False
 
-        if not compress:
-            dtype = str_to_dtype[dtype]
-            # print(flag)
-            
-            weight = home.allocate(shape, dtype, pin_memory=pin_memory)
+        dtype = str_to_dtype[dtype]
+        
+        weight = home.allocate(shape, dtype, pin_memory=pin_memory)
 
-            if DUMMY_WEIGHT not in str(filename):
-                weight.load_from_torch_file(weight_specs[i][2])
-            else:
-                weight.load_from_torch(torch.ones(shape, dtype))
-                #weight.load_from_np(np.random.rand(*shape).astype(dtype))
+        if DUMMY_WEIGHT not in str(filename):
+            weight.load_from_torch_file(weight_specs[i][2])
         else:
-            weight = home.compressed_device.allocate(
-                shape, dtype, policy.comp_weight_config, pin_memory=pin_memory)
-
-            if DUMMY_WEIGHT not in filename:
-                weight.load_from_torch_file(weight_specs[i][2])
-            else:
-                for i in range(2):
-                    x = weight.data[i]
-                    x.load_from_torch(torch.ones(x.shape, x.dtype))
-
+            raise NotImplementedError("Dummy weight is not supported for now!")
         ret.append(weight)
+        
     return ret
 
 def get_weight_tuple(h, path:str, prefix:str, weight_map:dict):
