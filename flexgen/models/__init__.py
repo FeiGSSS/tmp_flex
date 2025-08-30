@@ -1,4 +1,4 @@
-from flexgen.models import llama
+from flexgen.models import llama, deepseek
 from flexgen.models.config import FlexModelConfig
 from flexgen.models.utils import Policy, ExecutionEnv
 
@@ -49,6 +49,12 @@ def get_model_architecture(pretrained_model_path: str,
             pretrained_model_path,
             env,
             policy
+        )
+    elif 'deepseek' in _path:
+        return deepseek.DeepSeekV2LiteModel(
+            pretrained_model_path=pretrained_model_path,
+            env=env,
+            policy=policy
         )
     elif 'qwen2' in _path:
         raise NotImplementedError(f"Model architecture for type 'qwen2' is registering, Please hold on.")
