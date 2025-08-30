@@ -31,8 +31,6 @@ def apply_rotary_emb(
     xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
     xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
 
-    # Broadcast to [1, 1, seq_len, dim // 2]
-    # freqs_cis = freqs_cis.unsqueeze(1).to(xq_.device)
     freqs_cis = freqs_cis.to(xq_.device)
     xq_out = torch.view_as_real(xq_ * freqs_cis).flatten(3).type_as(xq)
     xk_out = torch.view_as_real(xk_ * freqs_cis).flatten(3).type_as(xk)
@@ -104,9 +102,6 @@ def mha(compute_device, inputs, attention_mask,
     k_nope = F.linear(k_nope, w_kv_b.data).view(key_shape).transpose(1, 2)
     k_nope, value_states = torch.split(k_nope, [qk_nope_head_dim, v_head_dim], dim=-1)
 
-    # k_pe = k_pe.view(b, 1, s, qk_rope_head_dim)
-    # k_pe, q_pe = apply_rotary_emb(q_pe, k_pe, freqs_cis)
-    # k_pe = k_pe.expand(*k_nope.shape[:-1], -1)
     k_pe = k_pe.view(b, 1, s, qk_rope_head_dim)
     q_pe, k_pe = apply_rotary_emb(q_pe, k_pe, freqs_cis) # <- 变量顺序已修正
     k_pe = k_pe.expand(*k_nope.shape[:-1], -1)
@@ -464,9 +459,8 @@ class DeepSeekV2LiteModel(BaseModel):
         loaded = BaseModel.load_from_pretrained_model(pretrained_model_path)
         self.state_dict, config, self.tokenizer = loaded
         
-        # TODO DEBUG
+        # pad_token of self.tokenizer  is <｜end▁of▁sentence｜>
         config['pad_token_id'] = config['eos_token_id']
-        self.tokenizer.pad_token = self.tokenizer.eos_token
         
         super().__init__(config, env, policy)
         
