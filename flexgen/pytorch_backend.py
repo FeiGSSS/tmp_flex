@@ -136,7 +136,7 @@ class TorchTensor:
 
     def __str__(self):
         return (f"TorchTensor(shape={self.shape}, dtype={str(self.dtype)}, "
-                f"device={self.device.name if self.device else None})")
+                f"device={self.device.device if self.device else None})")
 
 
 class TorchDevice:
@@ -153,16 +153,13 @@ class TorchDevice:
 
 
     def allocate(self, shape, dtype, pin_memory = True, name=None):
-        pin_memory = pin_memory if self.device == 'cpu' else False
+        pin_memory = False
 
         if self.device.startswith('cuda'):
             data = torch.empty(shape, dtype=dtype, pin_memory=pin_memory,
                                device=torch.device(self.device))
         else:
             data = NumaTensor.empty(shape, device=self.device, dtype=dtype)
-            if pin_memory:
-                if self.device == 'cxl': raise ValueError("CXL does not support pin_memory")
-                data = data.pin_memory()
         
         return TorchTensor.create_from_torch(data, self, name=name)
 
@@ -217,14 +214,16 @@ class TorchDevice:
         return TorchTensor.create_from_torch(data, self)
 
 
-    def init_cache_one_gpu_batch(self, config, task, policy):
-        num_head, hidden_size, prompt_len, gen_len, gpu_batch_size = (
-            config.n_head, config.input_dim, task.prompt_len, task.gen_len,
-            policy.gpu_batch_size)
-        shape = (prompt_len + gen_len - 1, gpu_batch_size * num_head, hidden_size // num_head)
+    def init_cache_one_gpu_batch(self, config, task, policy, kdim, vdim):
+        kshape = (task.prompt_len + task.gen_len - 1,
+                  policy.gpu_batch_size * config.num_key_value_heads,
+                  kdim)
+        vshape = (task.prompt_len + task.gen_len - 1,
+                  policy.gpu_batch_size * config.num_key_value_heads,
+                  vdim)
         # NOTE: disable pin_memory due to high memory overhead
-        k_cache = self.allocate(shape, str_to_dtype[config.torch_dtype], pin_memory=False)
-        v_cache = self.allocate(shape, str_to_dtype[config.torch_dtype], pin_memory=False)
+        k_cache = self.allocate(kshape, str_to_dtype[config.torch_dtype], pin_memory=False)
+        v_cache = self.allocate(vshape, str_to_dtype[config.torch_dtype], pin_memory=False)
         return k_cache, v_cache
 
 
@@ -301,14 +300,16 @@ class TorchDisk:
     def delete(self, tensor):
         if os.path.exists(tensor.data) and tensor.delete_file:
             os.remove(tensor.data)
-
-    def init_cache_one_gpu_batch(self, config, task, policy):
-        num_head, hidden_size, prompt_len, gen_len, gpu_batch_size = (
-            config.n_head, config.input_dim, task.prompt_len, task.gen_len,
-            policy.gpu_batch_size)
-        shape = (prompt_len + gen_len - 1, gpu_batch_size * num_head, hidden_size // num_head)
-        k_cache = self.allocate(shape, str_to_dtype[config.torch_dtype])
-        v_cache = self.allocate(shape, str_to_dtype[config.torch_dtype])
+    
+    def init_cache_one_gpu_batch(self, config, task, policy, kdim, vdim):
+        kshape = (task.prompt_len + task.gen_len - 1,
+                  policy.gpu_batch_size * config.num_key_value_heads,
+                  kdim)
+        vshape = (task.prompt_len + task.gen_len - 1,
+                  policy.gpu_batch_size * config.num_key_value_heads,
+                  vdim)
+        k_cache = self.allocate(kshape, str_to_dtype[config.torch_dtype])
+        v_cache = self.allocate(vshape, str_to_dtype[config.torch_dtype])
         return k_cache, v_cache
 
     def submit_copy(self, *args):

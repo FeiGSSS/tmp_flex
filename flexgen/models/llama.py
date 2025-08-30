@@ -1,5 +1,4 @@
 from typing import Dict, List, Union
-from copy import deepcopy
 
 import numpy as np
 
@@ -49,7 +48,6 @@ def mha(compute_device, inputs, attention_mask, w_q, w_k, w_v, w_out, w_ln,
     """
     mha 的最终调试版本，会打印每一步的中间结果。
     """
-
     b, s, h = inputs.shape
     head_dim = h // n_head
     
@@ -509,7 +507,10 @@ class LLaMASelfAttention(BaseModelLayer):
         task = getattr(self, 'task', None)
         assert task is not None, "Please set task before init cache."
 
-        cache = device.init_cache_one_gpu_batch(self.config, task, self.policy)
+        kdim = self.config.hidden_size // self.config.num_key_value_heads
+        vdim = kdim
+
+        cache = device.init_cache_one_gpu_batch(self.config, task, self.policy, kdim, vdim)
         cache_home.store(cache)
     
     def load_cache(self, 
@@ -572,22 +573,18 @@ class LLaMASelfAttention(BaseModelLayer):
         seq_len = h.shape[1]
         start_pos = 0 if token_idx == 0 else self.task.prompt_len + token_idx - 1
         freqs_cis = self.freqs_cis[start_pos:start_pos + seq_len]
-
+        mask, donate[1] = attention_mask.val.smart_copy(self.compute_device)
         if token_idx == 0:  # prefill
-            mask, donate[1] = attention_mask.val.smart_copy(self.compute_device)
-            h, new_k_cache, new_v_cache = mha(self.compute_device, h, mask, w_q, w_k, w_v,
-                                              w_out, w_ln,
-                                              self.config.num_key_value_heads, self.config.num_key_value_heads,
+            h, new_k_cache, new_v_cache = mha(self.compute_device, h, mask, w_q, w_k, w_v, w_out, w_ln,
+                                              self.config.num_attention_heads, self.config.num_key_value_heads,
                                               freqs_cis, donate)
-            cache_write_buf.store((new_k_cache, new_v_cache))
         else:  # decoding
-            mask, donate[1] = attention_mask.val.smart_copy(self.compute_device)
             (k_cache, donate[7]), (v_cache, donate[8]) = cache_read_buf.pop()
             h, new_k_cache, new_v_cache = mha_gen(self.compute_device, h, mask, w_q, w_k, w_v, w_out, w_ln,
-                                                  self.config.num_key_value_heads, self.config.num_key_value_heads,
+                                                  self.config.num_attention_heads, self.config.num_key_value_heads,
                                                   k_cache, v_cache, freqs_cis, donate)
-            cache_write_buf.store((new_k_cache, new_v_cache))
-
+        
+        cache_write_buf.store((new_k_cache, new_v_cache))
         hidden.val = h
 
 class LLaMAMLP(BaseModelLayer):
@@ -625,9 +622,10 @@ class LLaMAMLP(BaseModelLayer):
         w_gate, w_up, w_down, w_ln = weight_home.val
         if sub_batch_idx == 0:
             dst = self.compute_device
-            weight_read_buf.store((
-                w_gate.smart_copy(dst), w_up.smart_copy(dst),
-                w_down.smart_copy(dst), w_ln.smart_copy(dst)))
+            weight_read_buf.store((w_gate.smart_copy(dst),
+                                   w_up.smart_copy(dst),
+                                   w_down.smart_copy(dst),
+                                   w_ln.smart_copy(dst)))
     
     def forward(self, 
                 hidden, 

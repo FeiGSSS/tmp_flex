@@ -2,19 +2,15 @@ import argparse
 import torch
 
 from flexgen.models import get_model_architecture
-from flexgen.models.load_convert.load_weight import AutoFlexModel
-from flexgen.models.utils import Policy, ExecutionEnv, get_tokenizer
+from flexgen.models.utils import Policy, ExecutionEnv
 from flexgen.pytorch_backend import (TorchDevice, TorchDisk, fix_recursive_import)
 from flexgen.utils import (str2bool, project_decode_latency, write_benchmark_log, get_filename, DUMMY_WEIGHT, GB) 
-from flexgen.models.config import FlexModelConfig
 from flexgen.timer import timers
 
 
 fix_recursive_import()
 
 def add_parser_arguments(parser:argparse.ArgumentParser):
-    parser.add_argument("--model", type=str, default="llama2-7b",
-        help="The model name.")
     parser.add_argument("--path", type=str, default="/shared/model/Llama-2-7b-hf",
                         help="The path to the model weights. If there are no cached weights, "
                         "flexgen will automatically download them from HuggingFace.")
@@ -29,7 +25,7 @@ def add_parser_arguments(parser:argparse.ArgumentParser):
     parser.add_argument("--gpu-batch-size", type=int, default=2)
     parser.add_argument("--num-gpu-batches", type=int, default=1)
     parser.add_argument("--percent", nargs="+", type=int,
-        default=[100, 0, 0, 0, 0, 100, 100, 0, 0],
+        default=[50, 50, 0, 0, 0, 100, 100, 0, 0],
         help="Nine numbers. They are "
          "the percentage of weight on GPU, "
          "the percentage of weight on CPU, "
@@ -105,10 +101,6 @@ def main(args):
     print("init model...")
     model = get_model_architecture(pretrained_model_path=args.path, env=env, policy=policy)
     
-
-    # opt_config = get_opt_config(args.model)
-    # cache_size = opt_config.cache_bytes(num_prompts, prompt_len + gen_len)
-    # hidden_size = opt_config.hidden_bytes(num_prompts, prompt_len + gen_len)
     cache_size = model.cache_bytes(num_prompts, prompt_len + gen_len)
     hidden_size = model.hidden_bytes(num_prompts, prompt_len + gen_len)
     model_bytes = model.model_bytes()

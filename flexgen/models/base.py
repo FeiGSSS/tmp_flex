@@ -11,7 +11,15 @@ from transformers import AutoTokenizer
 from flexgen.utils import (ValueHolder, array_1d, array_2d, array_3d, str_to_dtype)
 from flexgen.timer import timers
 from flexgen.models.utils import ExecutionEnv, Policy, Task
+from flexgen.pytorch_backend import TorchTensor
 from types import SimpleNamespace
+
+def flatten(xs):
+    for x in xs:
+        if isinstance(x, (list, tuple)):
+            yield from flatten(x)
+        else:
+            yield x
 
 class BaseModelLayer:
     def __init__(self):
@@ -159,7 +167,12 @@ class BaseModel:
         for j in range(self.num_layers):
             if self.weight_home[j]:
                 for x in self.weight_home[j].pop():
-                    x.delete()
+                    if isinstance(x, TorchTensor):
+                        x.delete()
+                    else:
+                        x = flatten(x)
+                        for xx in x:
+                            xx.delete()
 
     def init_cache(self, 
                    layer_id: int,
@@ -362,8 +375,6 @@ class BaseModel:
             # print(f"DEBUG: Generation step {i}/{self.execute_gen_len-1}")
 
             for j in range(self.num_layers):
-                # print(f"DEBUG: Processing layer {j}/{self.num_layers-1}")
-
                 self.load_weight(i, j+1, 0)
                 self.load_cache(i, j+1, 0)
                 self.load_hidden(i, j, 0)

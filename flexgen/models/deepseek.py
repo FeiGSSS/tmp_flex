@@ -23,68 +23,25 @@ def rms_norm(x: torch.Tensor, norm_weight: torch.Tensor, eps: float = 1e-5):
     result = output * norm_weight.float()
     return result.type_as(x)
 
-def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0):
-    """预计算RoPE的频率张量"""
-    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
-    t = torch.arange(end, device=freqs.device)
-    freqs = torch.outer(t, freqs).float()
-    freqs_cis = torch.polar(torch.ones_like(freqs), freqs)
-    return freqs_cis
+def apply_rotary_emb(
+    xq: torch.Tensor,
+    xk: torch.Tensor,
+    freqs_cis: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
+    xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
 
-def reshape_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor):
-    """为RoPE重塑频率张量"""
-    ndim = x.ndim
-    assert freqs_cis.shape == (x.shape[1], x.shape[-1])
-    shape = [d if i == 1 or i == ndim - 1 else 1 for i, d in enumerate(x.shape)]
-    return freqs_cis.view(*shape)
-
-def apply_rotary_emb(xq: torch.Tensor, xk: torch.Tensor, freqs_cis: torch.Tensor):
-    """
-    应用旋转位置编码(RoPE) - 采用与Hugging Face transformers库更接近的实现方式。
-    这种方式不直接使用torch.complex，而是通过手动旋转一半的维度来实现，
-    这可能具有更好的数值稳定性。
-    """
-    def rotate_half(x):
-        """旋转输入张量的一半隐藏维度。"""
-        # 将最后一个维度切成两半
-        x1 = x[..., : x.shape[-1] // 2]
-        x2 = x[..., x.shape[-1] // 2 :]
-        # 将后半部分取反，然后与前半部分拼接
-        return torch.cat((-x2, x1), dim=-1)
-
-    # 从复数形式的 freqs_cis 中提取 cos 和 sin
-    # freqs_cis 的形状是 [seq_len, head_dim // 2]
-    # 我们需要将其 reshape 以便和 xq, xk 进行广播
-    cos = freqs_cis.real.to(xq.dtype)
-    sin = freqs_cis.imag.to(xq.dtype)
-    
-    # unsqueeze(0) for batch dim, unsqueeze(2) for n_head dim
-    # 最终形状变为 [1, seq_len, 1, head_dim // 2] 以匹配 (b, s, h, d)
-    # 但是 LLaMA 的 RoPE 是在 head_dim 级别操作的，所以需要重复
-    cos = cos.unsqueeze(0).unsqueeze(2)
-    sin = sin.unsqueeze(0).unsqueeze(2)
-    
-    # 广播 cos 和 sin 到完整的 head_dim
-    # [1, s, 1, d/2] -> [1, s, 1, d]
-    cos = cos.repeat(1, 1, 1, 2)
-    sin = sin.repeat(1, 1, 1, 2)
-
-    # 应用旋转编码
-    xq_out = (xq * cos) + (rotate_half(xq) * sin)
-    xk_out = (xk * cos) + (rotate_half(xk) * sin)
-    
+    # Broadcast to [1, 1, seq_len, dim // 2]
+    # freqs_cis = freqs_cis.unsqueeze(1).to(xq_.device)
+    freqs_cis = freqs_cis.to(xq_.device)
+    xq_out = torch.view_as_real(xq_ * freqs_cis).flatten(3).type_as(xq)
+    xk_out = torch.view_as_real(xk_ * freqs_cis).flatten(3).type_as(xk)
     return xq_out, xk_out
 
-def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
-    """为Grouped Query Attention重复key和value"""
-    bs, slen, n_kv_heads, head_dim = x.shape
-    if n_rep == 1:
-        return x
-    return (
-        x[:, :, :, None, :]
-        .expand(bs, slen, n_kv_heads, n_rep, head_dim)
-        .reshape(bs, slen, n_kv_heads * n_rep, head_dim)
-    )
+def _compute_inv_freq(dim: int, theta: float = 10000.0, device="cpu"):
+    """根据官方逻辑计算逆频率张量"""
+    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2, device=device).float() / dim))
+    return freqs
 
 def input_embed(compute_device, inputs, w_token, pad_token_id, donate):
     """输入嵌入层 - LLaMA只有token embedding，没有position embedding"""
@@ -134,18 +91,24 @@ def mha(compute_device, inputs, attention_mask,
     query_shape = (b, s, -1, qk_head_dim)
     key_shape = (b, s, -1, qk_nope_head_dim + v_head_dim)
 
-    q = w_q.data(hidden_states)
+    # q = w_q.data @ hidden_states
+    q = F.linear(hidden_states, w_q.data)
     
     q = q.view(query_shape).transpose(1, 2)
     q_nope, q_pe = torch.split(q, [qk_nope_head_dim, qk_rope_head_dim], dim=-1)
 
-    compressed_kv = w_kv_a.data(hidden_states)
+    # compressed_kv = w_kv_a.data(hidden_states)
+    compressed_kv = F.linear(hidden_states, w_kv_a.data)
     k_nope, k_pe = torch.split(compressed_kv, [kv_lora_rank, qk_rope_head_dim], dim=-1)
-    k_nope = w_kv_b.data(w_kv_a_ln.data(k_nope)).view(key_shape).transpose(1, 2)
+    k_nope = rms_norm(k_nope, w_kv_a_ln.data)
+    k_nope = F.linear(k_nope, w_kv_b.data).view(key_shape).transpose(1, 2)
     k_nope, value_states = torch.split(k_nope, [qk_nope_head_dim, v_head_dim], dim=-1)
 
+    # k_pe = k_pe.view(b, 1, s, qk_rope_head_dim)
+    # k_pe, q_pe = apply_rotary_emb(q_pe, k_pe, freqs_cis)
+    # k_pe = k_pe.expand(*k_nope.shape[:-1], -1)
     k_pe = k_pe.view(b, 1, s, qk_rope_head_dim)
-    k_pe, q_pe = apply_rotary_emb(q_pe, k_pe, freqs_cis)
+    q_pe, k_pe = apply_rotary_emb(q_pe, k_pe, freqs_cis) # <- 变量顺序已修正
     k_pe = k_pe.expand(*k_nope.shape[:-1], -1)
     query_states = torch.cat((q_nope, q_pe), dim=-1)
     key_states = torch.cat((k_nope, k_pe), dim=-1)
@@ -165,8 +128,8 @@ def mha(compute_device, inputs, attention_mask,
     if attention_mask is not None:
         padding_mask = ~(attention_mask.data.bool()).view(b, 1, 1, s)
         attn_weights = attn_weights.masked_fill(padding_mask, mask_fill_value)
-    if attention_mask is not None:
-        attn_weights = attn_weights + attention_mask.data
+    # if attention_mask is not None:
+    #     attn_weights = attn_weights + attention_mask.data
     # Softmax
     attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
     attn_output = torch.matmul(attn_weights, value_states)
@@ -206,17 +169,19 @@ def mha_gen(compute_device, inputs, attention_mask,
     query_shape = (b, tgt_s, -1, qk_head_dim)
     key_shape = (b, tgt_s, -1, qk_nope_head_dim + v_head_dim)
 
-    q = w_q.data(hidden_states)
+    # q = w_q.data(hidden_states)
+    q = F.linear(hidden_states, w_q.data)
     q = q.view(query_shape).transpose(1, 2)
     q_nope, q_pe = torch.split(q, [qk_nope_head_dim, qk_rope_head_dim], dim=-1)
 
-    compressed_kv = w_kv_a.data(hidden_states)
+    compressed_kv = F.linear(hidden_states, w_kv_a.data)
     k_nope, k_pe = torch.split(compressed_kv, [kv_lora_rank, qk_rope_head_dim], dim=-1)
-    k_nope = w_kv_b.data(w_kv_a_ln.data(k_nope)).view(key_shape).transpose(1, 2)
+    k_nope = rms_norm(k_nope, w_kv_a_ln.data)
+    k_nope = F.linear(k_nope, w_kv_b.data).view(key_shape).transpose(1, 2)
     k_nope, value_states = torch.split(k_nope, [qk_nope_head_dim, v_head_dim], dim=-1)
 
     k_pe = k_pe.view(b, 1, tgt_s, qk_rope_head_dim)
-    k_pe, q_pe = apply_rotary_emb(q_pe, k_pe, freqs_cis)
+    q_pe, k_pe = apply_rotary_emb(q_pe, k_pe, freqs_cis)
     k_pe = k_pe.expand(*k_nope.shape[:-1], -1)
     query_states = torch.cat((q_nope, q_pe), dim=-1)
     key_states = torch.cat((k_nope, k_pe), dim=-1)
@@ -224,16 +189,13 @@ def mha_gen(compute_device, inputs, attention_mask,
     # 5. 准备 k_new 和 v_new 用于 cache
     k_new_for_cache = key_states.permute(2, 0, 1, 3).contiguous().reshape(-1, b * n_head, qk_head_dim)
     v_new_for_cache = value_states.permute(2, 0, 1, 3).contiguous().reshape(-1, b * n_head, v_head_dim)
+    
+    k_cached = k_cache.data[:src_s-tgt_s]
+    v_cached = v_cache.data[:src_s-tgt_s]
+    
+    k_all = torch.cat([k_cached, k_new_for_cache], dim=0) # shape: (src_s, b * n_kv_heads, head_dim)
+    v_all = torch.cat([v_cached, v_new_for_cache], dim=0)
 
-    if isinstance(k_cache, TorchTensor):
-        k_cached = k_cache.data[:src_s-tgt_s]
-        v_cached = v_cache.data[:src_s-tgt_s]
-        
-        k_all = torch.cat([k_cached, k_new_for_cache], dim=0) # shape: (src_s, b * n_kv_heads, head_dim)
-        v_all = torch.cat([v_cached, v_new_for_cache], dim=0)
-    else:
-        k_all = k_new_for_cache # shape: (tgt_s, b * n_kv_heads, head_dim)
-        v_all = v_new_for_cache # shape: (tgt_s, b * n_kv_heads, head_dim)
     # 直接从 k_all 张量获取其真实的序列长度
     actual_seq_len = k_all.shape[0]
     # 使用真实长度进行 view 操作，并为保证内存连续性添加 .contiguous()
@@ -449,7 +411,7 @@ def  init_weight_list_moe(state_dict: Dict[str, torch.Tensor],
     for w, s, d in zip(shared_weights, shared_w_shapes, shared_w_dtypes):
         sw = compute_device.allocate(s, d, pin_memory=False) # TODO pin_memory ?
         sw.load_from_torch(w)
-    shared_ret.append(sw)
+        shared_ret.append(sw)
     
     routed_weights = [
         [state_dict[name] for name in weight_names_routed[i]]
@@ -464,10 +426,10 @@ def  init_weight_list_moe(state_dict: Dict[str, torch.Tensor],
         for i in range(len(routed_weights))
     ]
     sizes = [
-        np.prod([np.prod(shape) for shape in shape_list])
+        np.sum([np.prod(shape) for shape in shape_list])
         for shape_list in routed_w_shapes
     ]
-    sizes_cumsum = np.cumsum(sizes)
+    sizes_cumsum = np.cumsum(sizes, dtype=np.int64)
     
     routed_ret = []
     for expert, (weight_list, shape_list, dtype_list, size) in enumerate(zip(routed_weights,
@@ -476,17 +438,14 @@ def  init_weight_list_moe(state_dict: Dict[str, torch.Tensor],
                                                                              sizes)):
         mid_percent = (sizes_cumsum[expert] - size / 2) / sizes_cumsum[-1]
         home = get_choice(mid_percent * 100, dev_percents, dev_choices)
-        pin_memory = True if len(shape) < 2 else policy.pin_weight
         
         weights: List[TorchTensor] = [
-            home.allocate(shape, dtype, pin_memory=pin_memory)
+            home.allocate(shape, dtype, pin_memory=False) # TODO pin_memory ?
             for shape, dtype in zip(shape_list, dtype_list)
         ]
-        weights = [
+        for weight, w in zip(weights, weight_list):
             weight.load_from_torch(w)
-            for weight, w in zip(weights, weight_list)
-        ]
-        
+            
         routed_ret.append(weights)
         
     return (shared_ret, routed_ret)
@@ -511,9 +470,7 @@ class DeepSeekV2LiteModel(BaseModel):
         
         super().__init__(config, env, policy)
         
-        self.config.n_head = self.config.num_key_value_heads
-        self.config.input_dim = self.config.hidden_size
-        self.config.torch_dtype = 'torch.float16'
+        self.config.torch_dtype = 'torch.bfloat16'
         
         self.pretrained_model_path = pretrained_model_path
         self.env = env
@@ -525,7 +482,7 @@ class DeepSeekV2LiteModel(BaseModel):
                                                     self.env,
                                                     self.policy))
         
-        for layer_idx in range(config.num_hidden_layers):
+        for layer_idx in range(self.config.num_hidden_layers):
             if self.policy.sep_layer:
                 self.layers.append(DeepSeekV2LiteSelfAttention(state_dict=self.state_dict,
                                                                config=self.config,
@@ -546,7 +503,18 @@ class DeepSeekV2LiteModel(BaseModel):
                                                          layer_idx=layer_idx))
             else:
                 raise NotImplementedError("Only sep_layer=True is supported for DeepSeek-V2-Lite currently.")
-    
+
+        self.layers.append(DeepSeekV2LiteOutputEmbed(self.state_dict,
+                                                     self.config,
+                                                     self.env,
+                                                     self.policy))
+        
+        self.init_all_buffer()
+        self.init_all_weights()
+        
+        # after init weights, free self.state_dict
+        self.state_dict = None
+
     def model_bytes(self):
         return 0
     
@@ -637,11 +605,11 @@ class DeepSeekV2LiteSelfAttention(BaseModelLayer):
         
         self.compute_device = self.env.gpu
 
-        self.freqs_cis = precompute_freqs_cis(
-            dim = self.config.qk_rope_head_dim,
-            end = self.config.max_position_embeddings * 2,
-            theta = self.config.rope_theta
-        ).to(self.compute_device.device)
+        self.inv_freq = _compute_inv_freq(
+            dim=self.config.qk_rope_head_dim,
+            theta=self.config.rope_theta,
+            device=self.compute_device.device
+        )
 
     def init_weight(self, weight_home: ValueHolder):
         weight_names = [
@@ -687,8 +655,11 @@ class DeepSeekV2LiteSelfAttention(BaseModelLayer):
 
         task = getattr(self, 'task', None)
         assert task is not None, "Please set task before init cache."
+        
+        kdim = self.config.qk_nope_head_dim + self.config.qk_rope_head_dim
+        vdim = self.config.v_head_dim
 
-        cache = device.init_cache_one_gpu_batch(self.config, task, self.policy)
+        cache = device.init_cache_one_gpu_batch(self.config, task, self.policy, kdim, vdim)
         cache_home.store(cache)
         
         
@@ -727,7 +698,7 @@ class DeepSeekV2LiteSelfAttention(BaseModelLayer):
             pos = self.task.prompt_len + token_idx
             indices = (slice(pos - k_new.shape[0], pos),
                        slice(0, k_new.shape[1]))
-
+        
         general_copy(k_home, indices, k_new, None)
         general_copy(v_home, indices, v_new, None)
     
@@ -752,7 +723,28 @@ class DeepSeekV2LiteSelfAttention(BaseModelLayer):
         
         seq_len = h.shape[1]
         start_pos = 0 if token_idx == 0 else self.task.prompt_len + token_idx - 1
-        freqs_cis = self.freqs_cis[start_pos : start_pos + seq_len]
+        # freqs_cis = self.freqs_cis[start_pos : start_pos + seq_len]
+        # 1. 创建当前需要的位置ID
+        position_ids = torch.arange(
+            start_pos, start_pos + seq_len, dtype=torch.long, device=self.compute_device.device
+        ).unsqueeze(0) # shape: [1, seq_len]
+
+        # 2. 准备用于矩阵乘法的 inv_freq 和 position_ids
+        # inv_freq shape: [qk_rope_head_dim / 2]
+        inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1)
+        # shape: [1, qk_rope_head_dim / 2, 1]
+        
+        position_ids_expanded = position_ids[:, None, :].float()
+        # shape: [1, 1, seq_len]
+
+        # 3. 通过矩阵乘法计算频率
+        # [1, dim/2, 1] @ [1, 1, seq_len] -> [1, dim/2, seq_len]
+        freqs = (inv_freq_expanded @ position_ids_expanded).transpose(1, 2)
+        # shape after transpose: [1, seq_len, dim/2]
+
+        # 4. 转换为复数形式，并去掉多余的batch维度以匹配 apply_rotary_emb 的输入
+        freqs_cis = torch.polar(torch.ones_like(freqs), freqs).squeeze(0)
+        # shape: [seq_len, dim/2]
         
         # TODO DEBUG donate
         
@@ -760,7 +752,7 @@ class DeepSeekV2LiteSelfAttention(BaseModelLayer):
         if token_idx == 0: # Prefill
             output, new_k, new_v = mha(self.compute_device, h, mask,
                                        w_q, w_kv_a, w_kv_b, w_kv_a_ln, w_o, w_in_ln,
-                                       n_head=self.config.n_head,
+                                       n_head=self.config.num_attention_heads,
                                        qk_nope_head_dim=self.config.qk_nope_head_dim,
                                        qk_rope_head_dim=self.config.qk_rope_head_dim,
                                        v_head_dim=self.config.v_head_dim,
@@ -778,7 +770,7 @@ class DeepSeekV2LiteSelfAttention(BaseModelLayer):
                                             w_kv_a_ln=w_kv_a_ln,
                                             w_o=w_o,
                                             w_in_ln=w_in_ln,
-                                            n_head=self.config.n_head,
+                                            n_head=self.config.num_attention_heads,
                                             qk_nope_head_dim=self.config.qk_nope_head_dim,
                                             qk_rope_head_dim=self.config.qk_rope_head_dim,
                                             v_head_dim=self.config.v_head_dim,
@@ -914,9 +906,85 @@ class DeepSeekV2LiteMoE(BaseModelLayer):
                 [w.smart_copy(dst) for w in expert_weights]
                 for expert_weights in _routed_weight
             ]
-            
             weight_read_buf.store((shared_weight, routed_weight))
-            
+
+    def gate(self,
+             hidden_states: torch.Tensor,
+             weight_gate: TorchTensor):
+        
+        batch_size, seq_len, hidden_dim = hidden_states.shape
+        ### compute gating score
+        hidden_states = hidden_states.view(-1, hidden_dim)
+        logits = F.linear(hidden_states.type(torch.float32), weight_gate.data.type(torch.float32), None)
+        scores = logits.softmax(dim=-1, dtype=torch.float32)
+
+        # select top-k experts
+        # greedy method is used for DeepSeek-V2-Lite
+        # group_limited_greedy for DeepSeek-V2 and DeepSeek-V2-Chat
+        if self.config.topk_method == "greedy":
+            topk_weight, topk_idx = torch.topk(scores, k=self.config.num_experts_per_tok, dim=-1, sorted=False)
+        else:
+            raise NotImplementedError("Top-k method not implemented")
+
+        topk_weight = topk_weight * self.config.routed_scaling_factor
+        return topk_idx, topk_weight
+    
+    def moe(self,
+            hidden_states: torch.Tensor,
+            topk_ids: torch.Tensor,
+            topk_weight: torch.Tensor,
+            experts: List[List[Tuple[TorchTensor, bool]]]):
+        cnts = topk_ids.new_zeros((topk_ids.shape[0], len(experts)))
+        cnts.scatter_(1, topk_ids, 1)
+        tokens_per_expert = cnts.sum(dim=0)
+        indicies = topk_ids.view(-1).argsort()
+        sorted_tokens = hidden_states[indicies // topk_ids.shape[1]]
+
+        # Process experts
+        outputs = []
+        start_idx = 0
+        for i, num_tokens in enumerate(tokens_per_expert):
+            if num_tokens == 0:
+                continue
+            end_idx = start_idx + num_tokens
+            tokens_for_this_expert = sorted_tokens[start_idx:end_idx]
+            w_gate, w_up, w_down = experts[i]
+            expert_out = self.mlp_moe(tokens_for_this_expert, w_gate[0], w_up[0], w_down[0])
+            outputs.append(expert_out)
+            start_idx = end_idx
+
+        outs = torch.cat(outputs, dim=0) if outputs else sorted_tokens.new_empty(0)
+
+        # Reorder and combine outputs
+        new_x = torch.empty_like(outs)
+        new_x[indicies] = outs
+        hidden_states = (
+            new_x.view(*topk_ids.shape, -1)
+            .type(topk_weight.dtype)
+            .mul_(topk_weight.unsqueeze(dim=-1))
+            .sum(dim=1)
+            .type(new_x.dtype)
+        )
+        return hidden_states
+
+    def mlp_moe(self,
+                hidden_states: torch.Tensor,
+                w_gate: TorchTensor,
+                w_up: TorchTensor,
+                w_down: TorchTensor):
+        gate = F.linear(hidden_states, w_gate.data)
+        up = F.linear(hidden_states, w_up.data)       
+        silu_gate = F.silu(gate)  # SiLU activation
+        
+        intermediate = silu_gate * up  # Element-wise multiplication
+        
+        # Down projection
+        out = F.linear(intermediate, w_down.data)
+        
+        out = out + hidden_states  # Residual connection
+        return out
+    
+    
     def forward(self, 
                 hidden, 
                 cache_read_buf: ValueHolder, 
@@ -925,4 +993,88 @@ class DeepSeekV2LiteMoE(BaseModelLayer):
                 cache_write_buf: ValueHolder, 
                 token_idx: int,
                 sub_batch_idx:int):
-        pass
+        # Compute input embedding
+        donate = [False] * 15
+        h: TorchTensor = hidden.val
+        donate[0] = True
+
+        if sub_batch_idx == self.policy.num_gpu_batches - 1:
+            weight_shared, weight_route_experts = weight_read_buf.pop()
+        else:
+            weight_shared, weight_route_experts = weight_read_buf.val
+        
+        w_ln, w_gate, w_shared_experts_gate, w_shared_experts_up, w_shared_experts_down = weight_shared
+        
+        residuals_without_ln = h.data
+        hidden_states = rms_norm(residuals_without_ln, w_ln[0].data)
+
+        residuals_with_ln = hidden_states
+        orig_shape = hidden_states.shape
+        topk_indices, topk_weights = self.gate(hidden_states, w_gate[0])
+        hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
+        hidden_states = self.moe(hidden_states, topk_indices, topk_weights, weight_route_experts).view(*orig_shape)
+
+        hidden_states = hidden_states + self.mlp_moe(residuals_with_ln, w_shared_experts_gate[0], w_shared_experts_up[0], w_shared_experts_down[0])
+
+        hidden_states = residuals_without_ln + hidden_states
+        hidden.val = TorchTensor.create_from_torch(hidden_states, self.compute_device)
+
+        
+class DeepSeekV2LiteOutputEmbed(BaseModelLayer):
+    def __init__(self, 
+                 state_dict: Dict[str, torch.Tensor],
+                 config: Dict, 
+                 env: ExecutionEnv, 
+                 policy: Policy):
+        self.state_dict = state_dict
+        self.config = config
+        self.env = env
+        self.policy = policy
+        
+        self.compute_device = self.env.gpu
+        
+    def init_weight(self, weight_home: ValueHolder):
+        weight_names = [
+            "model.norm.weight",
+            "lm_head.weight"
+        ]
+        weights = init_weight_list(state_dict=self.state_dict,
+                                   weight_names=weight_names,
+                                   policy=self.policy,
+                                   env=self.env)
+        weight_home.store(weights)
+    
+    def load_weight(self, 
+                    weight_home: ValueHolder, 
+                    weight_read_buf: ValueHolder, 
+                    sub_batch_idx: int):
+        w_ln, w_token = weight_home.val
+        if sub_batch_idx == 0:
+            dst = self.compute_device
+            weight_read_buf.store((w_ln.smart_copy(dst), w_token.smart_copy(dst)))
+
+    def forward(self, 
+                hidden, 
+                cache_read_buf: ValueHolder, 
+                weight_read_buf: ValueHolder, 
+                attention_mask: ValueHolder,
+                cache_write_buf: ValueHolder, 
+                token_idx: int,
+                sub_batch_idx: int):
+
+        donate = [False] * 3
+        h, donate[0] = hidden.val, True
+
+        if sub_batch_idx == self.policy.num_gpu_batches - 1:
+            (w_ln, donate[1]), (w_token, donate[2]) = weight_read_buf.pop()
+        else:
+            (w_ln, _), (w_token, _) = weight_read_buf.val
+
+        task = getattr(self, 'task', None)
+        assert task is not None, "Please set task before forward."
+        
+        h, logits = output_embed(self.compute_device, h, w_ln, w_token, donate, task.do_sample, task.temperature)
+        if task.logits:
+            hidden.val = (h, logits)
+        else:
+            hidden.val = (h, None)
