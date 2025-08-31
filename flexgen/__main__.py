@@ -17,12 +17,12 @@ def add_parser_arguments(parser:argparse.ArgumentParser):
     parser.add_argument("--offload-dir", type=str, default="./flexgen_offload_dir",
         help="The directory to offload tensors. ")
     parser.add_argument("--prompt-len", type=int, default=512)
-    parser.add_argument("--gen-len", type=int, default=32)
+    parser.add_argument("--gen-len", type=int, default=128)
     parser.add_argument("--cut-gen-len", type=int,
         help="Cut generation length for fast debugging.")
     parser.add_argument("--debug-mode", type=str,
         choices=["fewer_batch", "breakdown"])
-    parser.add_argument("--gpu-batch-size", type=int, default=2)
+    parser.add_argument("--gpu-batch-size", type=int, default=4)
     parser.add_argument("--num-gpu-batches", type=int, default=1)
     parser.add_argument("--percent", nargs="+", type=int,
         default=[50, 50, 0, 0, 0, 100, 100, 0, 0],
@@ -63,11 +63,15 @@ def add_parser_arguments(parser:argparse.ArgumentParser):
 
 
 def get_test_inputs(prompt_len, num_prompts, tokenizer):
-    prompt1 = ("Summarize the following document: Officers searched properties in the Waterfront Park and Colonsay View areas of the city on Wednesday.\nDetectives said three firearms, ammunition and a five-figure sum of money were recovered.\nA 26-year-old man who was arrested and charged appeared at Edinburgh Sheriff Court on Thursday..\n")
-    prompt2 = ("Summarize the following document: Prison Link Cymru had 1,099 referrals in 2015-16 and said some ex-offenders were living rough for up to a year before finding suitable accommodation.\nWorkers at the charity claim investment in housing would be cheaper than jailing homeless repeat offenders.\nThe Welsh Government said more people than ever were getting help to address housing problems.\nChanges to the Housing Act in Wales, introduced in 2015, removed the right for prison leavers to be given priority for accommodation.\nPrison Link Cymru, which helps people find accommodation after their release, said things were generally good for women because issues such as children or domestic violence were now considered.\nHowever, the same could not be said for men, the charity said, because issues which often affect them, such as post traumatic stress disorder or drug dependency, were often viewed as less of a priority.\nAndrew Stevens, who works in Welsh prisons trying to secure housing for prison leavers, said the need for accommodation was \"chronic\".\n\"There's a desperate need for it, finding suitable accommodation for those leaving prison there is just a lack of it everywhere,\" he said.\n\"It could take six months to a year, without a lot of help they could be on the streets for six months.\n\"When you think of the consequences of either being on the street, especially with the cold weather at the moment or you may have a roof over your head, sometimes there is only one choice.\"\nMr Stevens believes building more one-bedroom flats could help ease the problem.\n\"The average price is a hundred pounds a week to keep someone in a rented flat, prison is a lot more than that so I would imagine it would save the public purse quite a few pounds,\" he said.\nOfficial figures show 830 one-bedroom properties were built in the year to March 2016, of an overall total of 6,900 new properties in Wales.\nMarc, 50, who has been in and out of prison for the past 20 years for burglary offences, said he struggled to find accommodation each time he was released.\nHe said he would ask himself: \"Where am I going to stay? Where am I going to live? Have I got somewhere where I can see my daughter.\"\n\"You're put out among the same sort of people doing the same sort of thing, and it's difficult, it's difficult to get away from it. It's like every man for himself, there's nothing.\"\nMarc has now found stable accommodation with homeless charity Emmaus and said it had been life changing.\n\"You feel safe, you got hot food, you've got company of people in similar situations to yourself but all dealing with different issues. It's a constructive, helpful atmosphere,\" he said.\nTom Clarke, chief executive of Emmaus South Wales, agreed there was not enough support available.\n\"We do still see [people] homeless on the streets, so clearly they haven't got accommodation and haven't got provision,\" he said.\n\"I think the key is connecting people with the services they need. I don't delude myself that Emmaus can offer a one size fits all for everyone, we can't.\n\"But there must be other opportunities and given suitable encouragement I believe that can and should happen.\"\nA Welsh Government spokesman said the national pathway for homeless services to children, young people and adults in the secure estate had prevented many people from losing their home whilst serving their prison sentence.\nIt added there were already significant demands for one-bedroom flats across the public and private sector and it was providing 20,000 new affordable homes in the next five years..\n")
 
-    prompts = [prompt1] * (num_prompts//2)
-    prompts += [prompt2] * (num_prompts - len(prompts))
+    prompts = [
+        "问题: 一杯冷水放在室温的房间里几个小时后，水温会趋近于什么？\n回答:",
+        "问题: 为什么天空在晴朗白天呈现蓝色？一句话解释。\n回答:",
+        "问题: 设一个等差数列首项为 3，公差为 5，第 20 项是多少？\n回答:", #"3 + 19*5 = 98"
+        "问题: 今天是星期三，10 天后是星期几？请给出推理步骤。\n回答:",  # "10 ≡ 3 (mod 7)，星期三往后 3 天是星期六"
+    ]
+
+    prompts = prompts[:num_prompts]
     
     input_ids = tokenizer(prompts, 
                           max_length=prompt_len,
@@ -116,7 +120,8 @@ def main(args):
         timers("generate").reset()
         output_ids, logits = model.generate(inputs=inputs,
                                             max_new_tokens=args.gen_len,
-                                            cut_gen_len=cut_gen_len)
+                                            cut_gen_len=cut_gen_len,
+                                            stop=model.config.eos_token_id)
         costs = timers("generate").costs
     finally:
         env.close_copy_threads()
@@ -137,9 +142,9 @@ def main(args):
     if DUMMY_WEIGHT not in args.path:
         outputs = tokenizer.batch_decode(output_ids, skip_special_tokens=True)
         show_str = "Outputs:\n" + 70 * '-' + "\n"
-        for i in [0, len(outputs)-1]:
-            show_str += f"{i}: {outputs[i]}\n"
-            show_str += "-" * 70 + "\n"
+        for i in range(len(outputs)):
+            show_str += f"{i}:\n {outputs[i]}\n"
+            show_str += "=*" * 20 + "\n"
         if args.verbose >= 2:
             print(show_str)
 

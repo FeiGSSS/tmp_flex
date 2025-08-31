@@ -300,8 +300,12 @@ class BaseModel:
 
             if self.task.stop:
                 stopped = self.stopped[left:right]
-                self.output_ids[left:right, pos:pos+1] = np.where(stopped, self.config.pad_token_id, ids)
-                stopped[:] = np.logical_or(stopped, ids == self.task.stop)
+                # self.output_ids[left:right, pos:pos+1] = np.where(stopped, self.config.pad_token_id, ids)
+                # stopped[:] = np.logical_or(stopped, ids == self.task.stop)
+                stopped = stopped.to(ids.device)
+                pad_filled = ids.masked_fill(stopped, self.config.pad_token_id)
+                self.output_ids[left:right, pos:pos+1] = pad_filled
+                self.stopped[left:right] = torch.logical_or(stopped, ids == self.task.stop).to(self.stopped.device)
             else:
                 self.output_ids[left:right, pos:pos+1] = ids
         else:
